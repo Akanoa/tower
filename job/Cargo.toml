@@ -1,0 +1,9 @@
+[package]
+name = "job"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+elyze = "1.5.5"
+thiserror = { workspace = true }
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }

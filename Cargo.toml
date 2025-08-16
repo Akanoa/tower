@@ -3,4 +3,10 @@ name = "unix_stream"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["job", "protocol", "server"]
+
+[workspace.dependencies]
+thiserror = "2.0.14"
+
 [dependencies]
