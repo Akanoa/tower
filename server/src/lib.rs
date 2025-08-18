@@ -1,15 +1,16 @@
 use crate::cli::Cli;
 use crate::error::ServerError;
 use clap::Parser;
-use protocol::bincode::error::DecodeError;
-use protocol::Message;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::select;
 use tracing::{debug, error, info, warn};
 
 mod cli;
 mod error;
+mod interface;
+
+use tokio::sync::mpsc;
 
 pub async fn run() -> Result<(), error::ServerError> {
     let _ = tracing_subscriber::fmt::init();
@@ -27,14 +28,24 @@ pub async fn run() -> Result<(), error::ServerError> {
 
     let server = UnixListener::bind(&args.socket)?;
 
+    // channel to forward all messages to TUI
+    let (tx, rx) = mpsc::unbounded_channel::<protocol::Message>();
+    // spawn TUI
+    tokio::spawn(async move {
+        if let Err(err) = interface::run_tui(rx).await {
+            error!(?err, "TUI exited with error");
+        }
+    });
+
     loop {
         select! {
             result = server.accept() => {
                 match result {
                     Ok((socket, _addr)) => {
-                        info!("new connection from {:?}", socket);
+                        // info!("new connection from {:?}", socket);
+                        let tx2 = tx.clone();
                         tokio::spawn(async move {
-                            let _ = handle_connection(socket).await;
+                            let _ = handle_connection(socket, tx2).await;
                         });
                     },
                     Err(error) => {
@@ -52,34 +63,55 @@ pub async fn run() -> Result<(), error::ServerError> {
     Ok(())
 }
 
-async fn handle_connection(stream: UnixStream) -> Result<(), error::ServerError> {
-    info!(peer=?stream.peer_addr()?,"New connection");
+async fn handle_connection(
+    stream: UnixStream,
+    tx: mpsc::UnboundedSender<protocol::Message>,
+) -> Result<(), error::ServerError> {
+    // info!(peer=?stream.peer_addr()?,"New connection");
     let (reader, writer) = stream.into_split();
 
-    let mut buffer = [0; 1024];
+    let mut read_buf = vec![];
+    let mut tmp = [0u8; 4096];
     let mut reader = tokio::io::BufReader::new(reader);
     let mut writer = tokio::io::BufWriter::new(writer);
     loop {
-        match reader.read(&mut buffer).await {
+        match reader.read(&mut tmp).await {
             Ok(0) => {
                 debug!("Connection closed");
                 break;
             }
             Ok(n) => {
-                debug!(len=n, data=?String::from_utf8_lossy(&buffer[..n]));
-                let data = &buffer[..n];
+                read_buf.extend_from_slice(&tmp[..n]);
 
-                let message = protocol::bincode::decode_from_slice::<protocol::Message, _>(
-                    data,
-                    protocol::bincode::config::standard(),
-                );
+                // Try to decode as many messages as available in the buffer
+                loop {
+                    match protocol::bincode::decode_from_slice::<protocol::Message, _>(
+                        &read_buf,
+                        protocol::bincode::config::standard(),
+                    ) {
+                        Ok((message, consumed)) => {
+                            // Remove the consumed bytes
+                            read_buf.drain(0..consumed);
 
-                match message {
-                    Ok((message, _)) => {
-                        info!(?message, "Receiving message");
-                    }
-                    Err(err) => {
-                        error!(?err, "Unable to decode message");
+                            // Forward all messages to the TUI task
+                            let _ = tx.send(message);
+
+                            // Continue the loop to decode next message (if any)
+                            continue;
+                        }
+                        Err(err) => {
+                            // If not enough bytes to decode a full message, wait for more data
+                            if matches!(
+                                err,
+                                protocol::bincode::error::DecodeError::UnexpectedEnd { .. }
+                            ) {
+                                break;
+                            }
+                            // On other decode errors, log and clear buffer to resync
+                            warn!(?err, "Decode error, clearing buffer to resync");
+                            read_buf.clear();
+                            break;
+                        }
                     }
                 }
             }
