@@ -229,6 +229,7 @@ name = "job"
 version = "0.1.0"
 dependencies = [
  "elyze",
+ "protocol",
  "rand",
  "thiserror",
  "tokio",
@@ -471,6 +472,7 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "protocol",
  "thiserror",
  "tokio",
  "tracing",

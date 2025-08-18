@@ -1,6 +1,8 @@
 use crate::cli::Cli;
 use crate::error::ServerError;
 use clap::Parser;
+use protocol::bincode::error::DecodeError;
+use protocol::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::select;
@@ -67,9 +69,19 @@ async fn handle_connection(stream: UnixStream) -> Result<(), error::ServerError>
                 debug!(len=n, data=?String::from_utf8_lossy(&buffer[..n]));
                 let data = &buffer[..n];
 
-                writer.write_all(b"Server: ").await?;
-                writer.write_all(data).await?;
-                writer.flush().await?;
+                let message = protocol::bincode::decode_from_slice::<protocol::Message, _>(
+                    data,
+                    protocol::bincode::config::standard(),
+                );
+
+                match message {
+                    Ok((message, _)) => {
+                        info!(?message, "Receiving message");
+                    }
+                    Err(err) => {
+                        error!(?err, "Unable to decode message");
+                    }
+                }
             }
             Err(error) => {
                 warn!(?error, "Error reading from socket");

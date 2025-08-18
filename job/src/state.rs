@@ -4,13 +4,12 @@ use crate::watcher::Watcher;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 pub struct State {
-    executors: RwLock<BTreeMap<i64, Executor>>,
-    rng: RwLock<StdRng>,
+    pub executors: RwLock<BTreeMap<i64, Executor>>,
+    pub(crate) rng: RwLock<StdRng>,
 }
 
 impl Default for State {
@@ -28,7 +27,7 @@ impl State {
         tenant: &str,
         executor_id: i64,
         interest: &str,
-    ) -> Result<(), JobError> {
+    ) -> Result<i64, JobError> {
         let watcher_id = self.rng.write().await.next_u32() as i64;
 
         self.executors
@@ -44,7 +43,7 @@ impl State {
             executor_id, watcher_id, interest, "Registering executor"
         );
 
-        Ok(())
+        Ok(watcher_id)
     }
 
     pub async fn unregister(

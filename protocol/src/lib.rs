@@ -1,6 +1,7 @@
-use bincode::{Decode, Encode};
+pub use bincode;
+pub use bincode::{Decode, Encode};
 
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, Debug)]
 pub enum Message {
     Register(MessageRegister),
     Unregister(MessageUnregister),
@@ -17,25 +18,25 @@ impl Message {
     }
 }
 
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, Debug)]
 pub struct MessageRegister {
-    tenant: String,
-    executor_id: i64,
-    watch_id: i64,
+    pub tenant: String,
+    pub executor_id: i64,
+    pub watch_id: i64,
 }
 
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, Debug)]
 pub struct MessageUnregister {
-    tenant: String,
-    executor_id: i64,
-    watch_id: i64,
+    pub tenant: String,
+    pub executor_id: i64,
+    pub watch_id: i64,
 }
 
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, Debug)]
 pub struct MessageReport {
-    tenant: String,
-    executor_id: i64,
-    watch_id: i64,
-    lag: u64,
-    execution_time: f64,
+    pub tenant: String,
+    pub executor_id: i64,
+    pub watch_id: i64,
+    pub lag: u64,
+    pub execution_time: f64,
 }
