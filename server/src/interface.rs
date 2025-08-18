@@ -141,6 +141,20 @@ impl AppState {
         }
     }
 
+    // Remove inactive watchers (> max_age since last update) and empty executors/tenants
+    pub fn prune_inactive(&mut self, max_age: Duration) {
+        let now = Instant::now();
+        self.tenants.retain(|_tname, tenant| {
+            tenant.executors.retain(|_eid, exec| {
+                exec.watchers.retain(|_wid, watch| {
+                    now.saturating_duration_since(watch.updated_at) <= max_age
+                });
+                !exec.watchers.is_empty()
+            });
+            !tenant.executors.is_empty()
+        });
+    }
+
     // Build visible rows respecting folding
     pub fn visible_rows(&self) -> Vec<Row<'static>> {
         let mut rows = Vec::new();
@@ -273,6 +287,7 @@ pub async fn run_tui(
 
     let mut app = AppState::default();
     let mut filtering = false;
+    let mut last_prune = Instant::now();
 
     // UI loop
     loop {
@@ -283,6 +298,11 @@ pub async fn run_tui(
                 Message::Register(r) => app.apply_register(r),
                 Message::Unregister(u) => app.apply_unregister(u),
             }
+        }
+        // Periodically prune inactive watchers/executors/tenants
+        if last_prune.elapsed() >= Duration::from_secs(5) {
+            app.prune_inactive(Duration::from_secs(60));
+            last_prune = Instant::now();
         }
 
         let selected_watch = app.selected_watch_ids();
