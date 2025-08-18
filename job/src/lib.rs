@@ -1,103 +1,23 @@
-use crate::commands::{Command, CommandRegister, CommandUnregister};
 use crate::errors::JobError;
-use std::collections::BTreeMap;
+use state::State;
 use std::io::{Read, Write};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use tracing::{error, info, warn};
 
 mod commands;
 mod errors;
+mod executor;
+mod state;
+mod watcher;
 
-#[derive(Default)]
-struct State {
-    executors: Arc<RwLock<BTreeMap<i64, Executor>>>,
-}
-
-impl State {
-    async fn register(
-        &self,
-        executor_id: i64,
-        watch_id: i64,
-        interest: &str,
-    ) -> Result<(), JobError> {
-        self.executors
-            .write()
-            .await
-            .entry(executor_id)
-            .or_insert(Executor::new(executor_id))
-            .watchers
-            .insert(watch_id, interest.into());
-
-        Ok(())
-    }
-
-    async fn unregister(&self, executor_id: i64, watch_id: i64) -> Result<(), JobError> {
-        Ok(())
-    }
-}
-
-struct Executor {
-    executor_id: i64,
-    watchers: BTreeMap<i64, Watcher>,
-}
-
-impl Executor {
-    fn new(executor_id: i64) -> Self {
-        Executor {
-            executor_id,
-            watchers: BTreeMap::new(),
-        }
-    }
-}
-
-struct Watcher {
-    watch_id: i64,
-    interest: String,
-}
-
-pub trait Action {
-    fn execute(self, state: &mut State) -> Result<(), JobError>;
-}
-
-impl Action for CommandRegister<'_> {
-    fn execute(&mut self) -> Result<(), JobError> {
-        let CommandRegister {
-            tenant,
-            executor_id,
-            interest,
-        } = self;
-        println!(
-            "Executing register for tenant '{tenant}' using executor #{executor_id} with interest '{interest}'"
-        );
-        Ok(())
-    }
-}
-
-impl Action for CommandUnregister<'_> {
-    fn execute(&mut self) -> Result<(), JobError> {
-        let CommandUnregister {
-            tenant,
-            executor_id,
-            watch_id,
-        } = self;
-        println!(
-            "Executing unregister for tenant '{tenant}' using executor #{executor_id} for watcher #{watch_id}'"
-        );
-        Ok(())
-    }
-}
-
-impl Action for Command<'_> {
-    fn execute(&mut self) -> Result<(), JobError> {
-        match self {
-            Command::Register(x) => x.execute(),
-            Command::Unregister(x) => x.execute(),
-        }
-    }
+trait Action {
+    async fn execute(self, state: &State) -> Result<(), JobError>;
 }
 
 pub async fn run() {
+    tracing_subscriber::fmt::init();
+
     let mut buffer = vec![0; 1024];
+    let state = State::default();
     println!("Please enter command");
     loop {
         print!("> ");
@@ -107,7 +27,12 @@ pub async fn run() {
             .read(&mut buffer)
             .expect("Unable to read input");
         let data = &buffer[..read_size].trim_ascii_end();
-        let mut command = commands::Command::from_slice(data).expect("Unable to parse command");
-        command.execute().expect("Unable to execute command");
+        let Ok(command) = commands::Command::from_slice(data) else {
+            warn!(input=?String::from_utf8_lossy(data), "Invalid command");
+            continue;
+        };
+        if let Err(err) = command.execute(&state).await {
+            error!(error = %err, "Error executing command")
+        }
     }
 }

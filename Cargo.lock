@@ -229,8 +229,11 @@ name = "job"
 version = "0.1.0"
 dependencies = [
  "elyze",
+ "rand",
  "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

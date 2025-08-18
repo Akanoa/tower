@@ -1,16 +1,16 @@
-use elyze::acceptor::Acceptor;
-use elyze::bytes::components::groups::GroupKind;
-use elyze::bytes::matchers::match_pattern;
-use elyze::bytes::primitives::whitespace::{OptionalWhitespaces, Whitespaces};
-use elyze::bytes::token::Token;
-use elyze::errors::ParseError::UnexpectedToken;
-use elyze::errors::ParseResult;
-use elyze::matcher::Match;
-use elyze::peek::{peek, UntilEnd};
-use elyze::peeker::Peeker;
-use elyze::recognizer::recognize;
-use elyze::scanner::Scanner;
 use elyze::visitor::Visitor;
+use elyze::scanner::Scanner;
+use elyze::errors::ParseResult;
+use elyze::peeker::Peeker;
+use elyze::bytes::token::Token;
+use elyze::peek::{peek, UntilEnd};
+use elyze::errors::ParseError::UnexpectedToken;
+use elyze::bytes::primitives::whitespace::{OptionalWhitespaces, Whitespaces};
+use elyze::bytes::components::groups::GroupKind;
+use elyze::matcher::Match;
+use elyze::bytes::matchers::match_pattern;
+use elyze::acceptor::Acceptor;
+use elyze::recognizer::recognize;
 
 enum Keyword {
     Register,
@@ -139,9 +139,9 @@ impl<'a> Visitor<'a, u8> for Command<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::commands::{Command, CommandRegister, CommandUnregister};
     use elyze::scanner::Scanner;
     use elyze::visitor::Visitor;
+    use crate::commands::parser::{Command, CommandRegister, CommandUnregister};
 
     #[test]
     fn test_command_register() {
