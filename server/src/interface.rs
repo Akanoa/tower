@@ -9,7 +9,6 @@ use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Row, Tab
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use chrono::{Local, TimeZone};
 use protocol::{Message, MessageBody, MessageRegister, MessageReport, MessageUnregister};
 
 pub type MessageReceiver = mpsc::UnboundedReceiver<Message>;
@@ -486,21 +485,33 @@ pub async fn run_tui(
                                 .zip(watch.exec_hist.iter().cloned())
                                 .collect();
 
-                            // Draw lag chart
-                            let x_min_ts = watch.time_hist.front().copied().unwrap_or(0.0);
-                            let x_max_ts = watch.time_hist.back().copied().unwrap_or(x_min_ts);
+                            // Shared X range (unix seconds)
+                            let x_min_ts = watch.time_hist.front().copied().unwrap_or_else(|| {
+                                { let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64(); (now - 10.0).max(0.0) }
+                            });
+                            let x_max_ts = watch.time_hist.back().copied().unwrap_or_else(|| {
+                                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
+                            });
+                            let x_upper = if x_max_ts > x_min_ts { x_max_ts } else { x_min_ts + 1.0 };
+
+                            // Render details header above the lag chart
+                            let lag_chunks = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
+                                .split(detail_inner[0]);
+                            f.render_widget(detail_block.clone(), lag_chunks[0]);
+
+                            // Lag chart (no X labels to avoid duplication; Y labels shown)
                             let y_max_lag = watch.lag_hist.iter().copied().max().unwrap_or(1) as f64;
                             let lag_chart = if lag_points.is_empty() {
-                                // Empty state: just show the block
                                 Chart::new(vec![] as Vec<Dataset>)
-                                    .block(detail_block.clone())
+                                    .block(Block::default().title("Lag message over time").borders(Borders::ALL))
                                     .x_axis(
                                         Axis::default()
-                                            .bounds({
-                                                let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
-                                                let x0 = (now_ts - 10.0).max(0.0);
-                                                [x0, now_ts]
-                                            })
+                                            .bounds([
+                                                (x_upper - 10.0).max(0.0),
+                                                x_upper,
+                                            ])
                                     )
                                     .y_axis(
                                         Axis::default()
@@ -514,13 +525,10 @@ pub async fn run_tui(
                                         .graph_type(GraphType::Line)
                                         .data(&lag_points),
                                 ])
-                                .block(detail_block.clone())
+                                .block(Block::default().title("Lag message over time").borders(Borders::ALL))
                                 .x_axis(
                                     Axis::default()
-                                        .bounds({
-                                            let x_upper = if x_max_ts > x_min_ts { x_max_ts } else { x_min_ts + 1.0 };
-                                            [x_min_ts, x_upper]
-                                        })
+                                        .bounds([x_min_ts, x_upper])
                                 )
                                 .y_axis(
                                     Axis::default()
@@ -531,31 +539,29 @@ pub async fn run_tui(
                                         })
                                 )
                             };
-                            f.render_widget(lag_chart, detail_inner[0]);
+                            f.render_widget(lag_chart, lag_chunks[1]);
 
-                            // Draw exec time chart
-                            let x_max_exec = (exec_points.len().saturating_sub(1)) as f64;
+                            // Exec time chart (shows human-readable time on X axis)
                             let y_max_exec = watch.exec_hist.iter().cloned().fold(0.0_f64, f64::max);
                             let exec_chart = if exec_points.is_empty() {
                                 Chart::new(vec![] as Vec<Dataset>)
                                     .block(Block::default().title("Exec Time (ms)").borders(Borders::ALL))
                                     .x_axis(
                                         Axis::default()
-                                            .bounds({
-                                                let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
-                                                let x0 = (now_ts - 10.0).max(0.0);
-                                                [x0, now_ts]
-                                            })
+                                            .bounds([
+                                                (x_upper - 10.0).max(0.0),
+                                                x_upper,
+                                            ])
                                             .labels({
-                                                let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
-                                                let x0 = (now_ts - 10.0).max(0.0);
-                                                let mid = (x0 + now_ts) / 2.0;
+                                                use chrono::{Local, TimeZone};
+                                                let x0 = (x_upper - 10.0).max(0.0);
+                                                let mid = (x0 + x_upper) / 2.0;
                                                 let fmt = |ts: f64| -> String {
                                                     let secs = ts.floor() as i64;
                                                     let dt = match Local.timestamp_opt(secs, 0) { chrono::LocalResult::Single(dt) => dt, _ => Local.timestamp(0, 0) };
                                                     dt.format("%H:%M:%S").to_string()
                                                 };
-                                                vec![Span::from(fmt(x0)), Span::from(fmt(mid)), Span::from(fmt(now_ts))]
+                                                vec![Span::from(fmt(x0)), Span::from(fmt(mid)), Span::from(fmt(x_upper))]
                                             })
                                     )
                                     .y_axis(
@@ -573,12 +579,9 @@ pub async fn run_tui(
                                 .block(Block::default().title("Exec Time (ms)").borders(Borders::ALL))
                                 .x_axis(
                                     Axis::default()
-                                        .bounds({
-                                            let x_upper = if x_max_ts > x_min_ts { x_max_ts } else { x_min_ts + 1.0 };
-                                            [x_min_ts, x_upper]
-                                        })
+                                        .bounds([x_min_ts, x_upper])
                                         .labels({
-                                            let x_upper = if x_max_ts > x_min_ts { x_max_ts } else { x_min_ts + 1.0 };
+                                            use chrono::{Local, TimeZone};
                                             let mid = (x_min_ts + x_upper) / 2.0;
                                             let fmt = |ts: f64| -> String {
                                                 let secs = ts.floor() as i64;
