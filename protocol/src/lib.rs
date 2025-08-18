@@ -39,4 +39,5 @@ pub struct MessageReport {
     pub watch_id: i64,
     pub lag: u64,
     pub execution_time: f64,
+    pub interest: String,
 }

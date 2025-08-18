@@ -1,15 +1,16 @@
-use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::collections::{BTreeMap, VecDeque};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Row, Table};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Row, Table};
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use protocol::{Message, MessageRegister, MessageReport, MessageUnregister};
+use chrono::{Local, TimeZone};
 
 pub type MessageReceiver = mpsc::UnboundedReceiver<Message>;
 
@@ -19,6 +20,10 @@ pub struct WatchItem {
     pub lag: u64,
     pub execution_time: f64,
     pub updated_at: Instant,
+    pub interest: String,
+    pub lag_hist: VecDeque<u64>,
+    pub exec_hist: VecDeque<f64>,
+    pub time_hist: VecDeque<f64>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -70,10 +75,33 @@ impl AppState {
                 lag: 0,
                 execution_time: 0.0,
                 updated_at: Instant::now(),
+                interest: report.interest.clone(),
+                lag_hist: VecDeque::new(),
+                exec_hist: VecDeque::new(),
+                time_hist: VecDeque::new(),
             });
+        // Update fields
         watch.lag = report.lag;
         watch.execution_time = report.execution_time;
         watch.updated_at = Instant::now();
+        // Update interest if it changed or was empty
+        if watch.interest.is_empty() {
+            watch.interest = report.interest.clone();
+        }
+        // Append to history with a cap to avoid unbounded growth
+        const MAX_POINTS: usize = 200;
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        watch.time_hist.push_back(now_ts);
+        watch.lag_hist.push_back(report.lag);
+        watch.exec_hist.push_back(report.execution_time);
+        while watch.time_hist.len() > MAX_POINTS {
+            let _ = watch.time_hist.pop_front();
+            let _ = watch.lag_hist.pop_front();
+            let _ = watch.exec_hist.pop_front();
+        }
     }
 
     pub fn apply_register(&mut self, reg: MessageRegister) {
@@ -98,6 +126,10 @@ impl AppState {
             lag: 0,
             execution_time: 0.0,
             updated_at: Instant::now(),
+            interest: String::new(),
+            lag_hist: VecDeque::new(),
+            exec_hist: VecDeque::new(),
+            time_hist: VecDeque::new(),
         });
     }
 
@@ -189,6 +221,35 @@ impl AppState {
             }
         }
     }
+
+    // Resolve current selection to a watcher identifier if selection points to a watcher row
+    pub fn selected_watch_ids(&self) -> Option<(String, i64, i64)> {
+        let mut i = 0usize;
+        let filt = if self.filter.is_empty() { None } else { Some(self.filter.to_lowercase()) };
+        for (tenant_name, tenant) in &self.tenants {
+            if let Some(ref f) = filt {
+                if !tenant_name.to_lowercase().contains(f) { continue; }
+            }
+            if i == self.selected {
+                // tenant row selected
+                return None;
+            }
+            i += 1;
+            if tenant.folded { continue; }
+            for (exec_id, exec) in &tenant.executors {
+                if i == self.selected { return None; }
+                i += 1;
+                if exec.folded { continue; }
+                for (watch_id, _watch) in &exec.watchers {
+                    if i == self.selected {
+                        return Some((tenant_name.clone(), *exec_id, *watch_id));
+                    }
+                    i += 1;
+                }
+            }
+        }
+        None
+    }
 }
 
 pub async fn run_tui(
@@ -224,6 +285,7 @@ pub async fn run_tui(
             }
         }
 
+        let selected_watch = app.selected_watch_ids();
         terminal.draw(|f| {
             let size = f.area();
             let chunks = Layout::default()
@@ -268,7 +330,168 @@ pub async fn run_tui(
                 ]).style(Style::default().add_modifier(Modifier::BOLD)))
                 .block(Block::default().borders(Borders::ALL));
 
-            f.render_widget(table, chunks[1]);
+            // If a watcher is selected, show details pane with charts below the table
+            if let Some((ref tenant_name, exec_id, watch_id)) = selected_watch {
+                let main_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Percentage(60), Constraint::Percentage(40)].as_ref())
+                    .split(chunks[1]);
+                // render table in top part
+                f.render_widget(&table, main_chunks[0]);
+
+                // Render details in bottom part
+                if let Some(tenant) = app.tenants.get(tenant_name) {
+                    if let Some(exec) = tenant.executors.get(&exec_id) {
+                        if let Some(watch) = exec.watchers.get(&watch_id) {
+                            let detail_title = format!(
+                                "Details: {tenant_name} / Exec #{exec_id} / Watch #{watch_id} | Interest: {}",
+                                if watch.interest.is_empty() { "<unknown>" } else { &watch.interest }
+                            );
+                            let detail_block = Block::default().title(detail_title).borders(Borders::ALL);
+                            // Split details area into two charts: Lag and Exec Time
+                            let detail_inner = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+                                .split(main_chunks[1]);
+
+                            // Prepare data points aligned on Unix time
+                            let times = &watch.time_hist;
+                            let lag_points: Vec<(f64, f64)> = times
+                                .iter()
+                                .cloned()
+                                .zip(watch.lag_hist.iter().map(|v| *v as f64))
+                                .collect();
+                            let exec_points: Vec<(f64, f64)> = times
+                                .iter()
+                                .cloned()
+                                .zip(watch.exec_hist.iter().cloned())
+                                .collect();
+
+                            // Draw lag chart
+                            let x_min_ts = watch.time_hist.front().copied().unwrap_or(0.0);
+                            let x_max_ts = watch.time_hist.back().copied().unwrap_or(x_min_ts);
+                            let y_max_lag = watch.lag_hist.iter().copied().max().unwrap_or(1) as f64;
+                            let lag_chart = if lag_points.is_empty() {
+                                // Empty state: just show the block
+                                Chart::new(vec![] as Vec<Dataset>)
+                                    .block(detail_block.clone())
+                                    .x_axis(
+                                        Axis::default()
+                                            .bounds({
+                                                let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+                                                let x0 = (now_ts - 10.0).max(0.0);
+                                                [x0, now_ts]
+                                            })
+                                    )
+                                    .y_axis(
+                                        Axis::default()
+                                            .bounds([0.0, 1.0])
+                                            .labels(vec![Span::from("0"), Span::from("0.5"), Span::from("1.0")])
+                                    )
+                            } else {
+                                Chart::new(vec![
+                                    Dataset::default()
+                                        .name("Lag")
+                                        .graph_type(GraphType::Line)
+                                        .data(&lag_points),
+                                ])
+                                .block(detail_block.clone())
+                                .x_axis(
+                                    Axis::default()
+                                        .bounds({
+                                            let x_upper = if x_max_ts > x_min_ts { x_max_ts } else { x_min_ts + 1.0 };
+                                            [x_min_ts, x_upper]
+                                        })
+                                )
+                                .y_axis(
+                                    Axis::default()
+                                        .bounds([0.0, y_max_lag.max(1.0)])
+                                        .labels({
+                                            let max = y_max_lag.max(1.0);
+                                            vec![Span::from("0"), Span::from(format!("{:.0}", max/2.0)), Span::from(format!("{:.0}", max))]
+                                        })
+                                )
+                            };
+                            f.render_widget(lag_chart, detail_inner[0]);
+
+                            // Draw exec time chart
+                            let x_max_exec = (exec_points.len().saturating_sub(1)) as f64;
+                            let y_max_exec = watch.exec_hist.iter().cloned().fold(0.0_f64, f64::max);
+                            let exec_chart = if exec_points.is_empty() {
+                                Chart::new(vec![] as Vec<Dataset>)
+                                    .block(Block::default().title("Exec Time (ms)").borders(Borders::ALL))
+                                    .x_axis(
+                                        Axis::default()
+                                            .bounds({
+                                                let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+                                                let x0 = (now_ts - 10.0).max(0.0);
+                                                [x0, now_ts]
+                                            })
+                                            .labels({
+                                                let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+                                                let x0 = (now_ts - 10.0).max(0.0);
+                                                let mid = (x0 + now_ts) / 2.0;
+                                                let fmt = |ts: f64| -> String {
+                                                    let secs = ts.floor() as i64;
+                                                    let dt = match Local.timestamp_opt(secs, 0) { chrono::LocalResult::Single(dt) => dt, _ => Local.timestamp(0, 0) };
+                                                    dt.format("%H:%M:%S").to_string()
+                                                };
+                                                vec![Span::from(fmt(x0)), Span::from(fmt(mid)), Span::from(fmt(now_ts))]
+                                            })
+                                    )
+                                    .y_axis(
+                                        Axis::default()
+                                            .bounds([0.0, 1.0])
+                                            .labels(vec![Span::from("0"), Span::from("0.5"), Span::from("1.0")])
+                                    )
+                            } else {
+                                Chart::new(vec![
+                                    Dataset::default()
+                                        .name("Exec ms")
+                                        .graph_type(GraphType::Line)
+                                        .data(&exec_points),
+                                ])
+                                .block(Block::default().title("Exec Time (ms)").borders(Borders::ALL))
+                                .x_axis(
+                                    Axis::default()
+                                        .bounds({
+                                            let x_upper = if x_max_ts > x_min_ts { x_max_ts } else { x_min_ts + 1.0 };
+                                            [x_min_ts, x_upper]
+                                        })
+                                        .labels({
+                                            let x_upper = if x_max_ts > x_min_ts { x_max_ts } else { x_min_ts + 1.0 };
+                                            let mid = (x_min_ts + x_upper) / 2.0;
+                                            let fmt = |ts: f64| -> String {
+                                                let secs = ts.floor() as i64;
+                                                let dt = match Local.timestamp_opt(secs, 0) { chrono::LocalResult::Single(dt) => dt, _ => Local.timestamp(0, 0) };
+                                                dt.format("%H:%M:%S").to_string()
+                                            };
+                                            vec![Span::from(fmt(x_min_ts)), Span::from(fmt(mid)), Span::from(fmt(x_upper))]
+                                        })
+                                )
+                                .y_axis(
+                                    Axis::default()
+                                        .bounds([0.0, y_max_exec.max(1.0)])
+                                        .labels({
+                                            let max = y_max_exec.max(1.0);
+                                            vec![Span::from("0"), Span::from(format!("{:.0}", max/2.0)), Span::from(format!("{:.0}", max))]
+                                        })
+                                )
+                            };
+                            f.render_widget(exec_chart, detail_inner[1]);
+                        } else {
+                            // watcher missing
+                        }
+                    } else {
+                        // executor missing
+                    }
+                } else {
+                    // tenant missing
+                }
+            } else {
+                // No watcher selected, render full-height table
+                f.render_widget(&table, chunks[1]);
+            }
         })?;
 
         // Input handling with small timeout to keep UI responsive

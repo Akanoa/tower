@@ -33,6 +33,7 @@ impl Watcher {
             watch_id: self.watch_id,
             lag,
             execution_time,
+            interest: self.interest.clone(),
         };
 
         Ok(report)
