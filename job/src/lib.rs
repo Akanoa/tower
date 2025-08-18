@@ -39,7 +39,7 @@ pub async fn run() {
     let socket = Arc::new(RwLock::new(socket));
 
     let mut buffer = vec![0; 1024];
-    let state = Arc::new(State::default());
+    let state = Arc::new(State::new("localhost:8080"));
 
     if let Some(file) = args.file {
         handle_file(state.clone(), socket.clone(), file).await;

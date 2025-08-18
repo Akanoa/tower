@@ -2,7 +2,7 @@ use crate::errors::JobError;
 use crate::state::State;
 use crate::watcher::Watcher;
 use protocol;
-use protocol::Message;
+use protocol::{Message, MessageBody};
 use std::collections::BTreeMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -30,7 +30,10 @@ impl Executor {
 
         for watcher in self.watchers.values() {
             let report = watcher.run(&self.tenant, self.executor_id, state).await?;
-            reports.push(Message::Report(report));
+            reports.push(Message::new(
+                state.host.clone(),
+                MessageBody::Report(report),
+            ));
         }
 
         let mut buffer = vec![0_u8; 1024];

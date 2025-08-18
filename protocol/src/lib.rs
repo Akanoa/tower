@@ -2,7 +2,19 @@ pub use bincode;
 pub use bincode::{Decode, Encode};
 
 #[derive(Encode, Decode, Debug)]
-pub enum Message {
+pub struct Message {
+    pub host: String,
+    pub body: MessageBody,
+}
+
+impl Message {
+    pub fn new(host: String, body: MessageBody) -> Message {
+        Message { host, body }
+    }
+}
+
+#[derive(Encode, Decode, Debug)]
+pub enum MessageBody {
     Register(MessageRegister),
     Unregister(MessageUnregister),
     Report(MessageReport),

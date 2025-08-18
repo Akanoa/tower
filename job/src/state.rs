@@ -8,13 +8,15 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 pub struct State {
+    pub host: String,
     pub executors: RwLock<BTreeMap<i64, Executor>>,
     pub(crate) rng: RwLock<StdRng>,
 }
 
-impl Default for State {
-    fn default() -> Self {
+impl State {
+    pub(crate) fn new(host: &str) -> Self {
         State {
+            host: host.to_string(),
             executors: Default::default(),
             rng: RwLock::new(StdRng::from_os_rng()),
         }

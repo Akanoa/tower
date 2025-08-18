@@ -4,7 +4,7 @@ use crate::errors::JobError;
 use crate::state::State;
 use crate::Action;
 pub use parser::*;
-use protocol::{Message, MessageRegister, MessageUnregister};
+use protocol::{Message, MessageBody, MessageRegister, MessageUnregister};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::RwLock;
@@ -17,11 +17,14 @@ impl Action for CommandRegister<'_> {
             interest,
         } = self;
         let watch_id = state.register(tenant, executor_id, interest).await?;
-        let register_message = Message::Register(MessageRegister {
-            tenant: tenant.into(),
-            watch_id,
-            executor_id,
-        });
+        let register_message = Message::new(
+            state.host.clone(),
+            MessageBody::Register(MessageRegister {
+                tenant: tenant.into(),
+                watch_id,
+                executor_id,
+            }),
+        );
         let buffer = register_message.encode()?;
 
         let mut socket = socket.write().await;
@@ -40,11 +43,14 @@ impl Action for CommandUnregister<'_> {
         } = self;
         state.unregister(tenant, executor_id, watch_id).await?;
 
-        let unregister_message = Message::Unregister(MessageUnregister {
-            tenant: tenant.into(),
-            executor_id,
-            watch_id,
-        });
+        let unregister_message = Message::new(
+            state.host.clone(),
+            MessageBody::Unregister(MessageUnregister {
+                tenant: tenant.into(),
+                executor_id,
+                watch_id,
+            }),
+        );
 
         let buffer = unregister_message.encode()?;
         let mut socket = socket.write().await;

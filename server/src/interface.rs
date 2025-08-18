@@ -9,8 +9,8 @@ use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Row, Tab
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use protocol::{Message, MessageRegister, MessageReport, MessageUnregister};
 use chrono::{Local, TimeZone};
+use protocol::{Message, MessageBody, MessageRegister, MessageReport, MessageUnregister};
 
 pub type MessageReceiver = mpsc::UnboundedReceiver<Message>;
 
@@ -31,6 +31,7 @@ pub struct ExecutorItem {
     pub executor_id: i64,
     pub folded: bool,
     pub watchers: BTreeMap<i64, WatchItem>,
+    pub host: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -50,7 +51,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn apply_report(&mut self, report: MessageReport) {
+    pub fn apply_report(&mut self, host: String, report: MessageReport) {
         let tenant_entry = self
             .tenants
             .entry(report.tenant.clone())
@@ -66,7 +67,10 @@ impl AppState {
                 executor_id: report.executor_id,
                 folded: false,
                 watchers: BTreeMap::new(),
+                host: host.clone(),
             });
+        // keep host updated
+        exec_entry.host = host.clone();
         let watch = exec_entry
             .watchers
             .entry(report.watch_id)
@@ -104,7 +108,7 @@ impl AppState {
         }
     }
 
-    pub fn apply_register(&mut self, reg: MessageRegister) {
+    pub fn apply_register(&mut self, host: String, reg: MessageRegister) {
         let tenant_entry = self
             .tenants
             .entry(reg.tenant.clone())
@@ -120,22 +124,28 @@ impl AppState {
                 executor_id: reg.executor_id,
                 folded: false,
                 watchers: BTreeMap::new(),
+                host: host.clone(),
             });
-        exec_entry.watchers.entry(reg.watch_id).or_insert_with(|| WatchItem {
-            watch_id: reg.watch_id,
-            lag: 0,
-            execution_time: 0.0,
-            updated_at: Instant::now(),
-            interest: String::new(),
-            lag_hist: VecDeque::new(),
-            exec_hist: VecDeque::new(),
-            time_hist: VecDeque::new(),
-        });
+        exec_entry.host = host.clone();
+        exec_entry
+            .watchers
+            .entry(reg.watch_id)
+            .or_insert_with(|| WatchItem {
+                watch_id: reg.watch_id,
+                lag: 0,
+                execution_time: 0.0,
+                updated_at: Instant::now(),
+                interest: String::new(),
+                lag_hist: VecDeque::new(),
+                exec_hist: VecDeque::new(),
+                time_hist: VecDeque::new(),
+            });
     }
 
-    pub fn apply_unregister(&mut self, unreg: MessageUnregister) {
+    pub fn apply_unregister(&mut self, host: String, unreg: MessageUnregister) {
         if let Some(tenant) = self.tenants.get_mut(&unreg.tenant) {
             if let Some(exec) = tenant.executors.get_mut(&unreg.executor_id) {
+                exec.host = host;
                 exec.watchers.remove(&unreg.watch_id);
             }
         }
@@ -176,6 +186,7 @@ impl AppState {
                     Line::from(""),
                     Line::from(""),
                     Line::from(""),
+                    Line::from(""),
                 ])
                 .style(Style::default().add_modifier(Modifier::BOLD)),
             );
@@ -184,11 +195,21 @@ impl AppState {
             }
             for (exec_id, exec) in &tenant.executors {
                 let e_prefix = if exec.folded { "  ▸" } else { "  ▾" };
+                // Compute means from current watcher values
+                let n = exec.watchers.len() as f64;
+                let (mean_lag, mean_exec) = if n > 0.0 {
+                    let sum_lag: u128 = exec.watchers.values().map(|w| w.lag as u128).sum();
+                    let sum_exec: f64 = exec.watchers.values().map(|w| w.execution_time).sum();
+                    ((sum_lag as f64 / n).round() as u64, sum_exec / n)
+                } else {
+                    (0u64, 0.0f64)
+                };
                 rows.push(Row::new(vec![
                     Line::from(format!("{e_prefix} Executor #{exec_id}")),
+                    Line::from(format!("{}", mean_lag)),
+                    Line::from(format!("{:.3} ms", mean_exec)),
                     Line::from(""),
-                    Line::from(""),
-                    Line::from(""),
+                    Line::from(exec.host.clone()),
                 ]));
                 if exec.folded {
                     continue;
@@ -202,6 +223,7 @@ impl AppState {
                             "{:?}",
                             Instant::now().saturating_duration_since(watch.updated_at)
                         )),
+                        Line::from(""),
                     ]));
                 }
             }
@@ -239,21 +261,33 @@ impl AppState {
     // Resolve current selection to a watcher identifier if selection points to a watcher row
     pub fn selected_watch_ids(&self) -> Option<(String, i64, i64)> {
         let mut i = 0usize;
-        let filt = if self.filter.is_empty() { None } else { Some(self.filter.to_lowercase()) };
+        let filt = if self.filter.is_empty() {
+            None
+        } else {
+            Some(self.filter.to_lowercase())
+        };
         for (tenant_name, tenant) in &self.tenants {
             if let Some(ref f) = filt {
-                if !tenant_name.to_lowercase().contains(f) { continue; }
+                if !tenant_name.to_lowercase().contains(f) {
+                    continue;
+                }
             }
             if i == self.selected {
                 // tenant row selected
                 return None;
             }
             i += 1;
-            if tenant.folded { continue; }
+            if tenant.folded {
+                continue;
+            }
             for (exec_id, exec) in &tenant.executors {
-                if i == self.selected { return None; }
+                if i == self.selected {
+                    return None;
+                }
                 i += 1;
-                if exec.folded { continue; }
+                if exec.folded {
+                    continue;
+                }
                 for (watch_id, _watch) in &exec.watchers {
                     if i == self.selected {
                         return Some((tenant_name.clone(), *exec_id, *watch_id));
@@ -293,10 +327,10 @@ pub async fn run_tui(
     loop {
         // Drain incoming messages without blocking UI
         while let Ok(msg) = rx.try_recv() {
-            match msg {
-                Message::Report(r) => app.apply_report(r),
-                Message::Register(r) => app.apply_register(r),
-                Message::Unregister(u) => app.apply_unregister(u),
+            match msg.body {
+                MessageBody::Report(r) => app.apply_report(msg.host.clone(), r),
+                MessageBody::Register(r) => app.apply_register(msg.host.clone(), r),
+                MessageBody::Unregister(u) => app.apply_unregister(msg.host.clone(), u),
             }
         }
         // Periodically prune inactive watchers/executors/tenants
@@ -335,10 +369,11 @@ pub async fn run_tui(
                 .collect();
 
             let widths = [
-                Constraint::Percentage(50),
+                Constraint::Percentage(40),
                 Constraint::Percentage(10),
+                Constraint::Percentage(15),
                 Constraint::Percentage(20),
-                Constraint::Percentage(20),
+                Constraint::Percentage(15),
             ];
 
             let table = Table::new(rows, widths)
@@ -347,6 +382,7 @@ pub async fn run_tui(
                     Line::from("Lag"),
                     Line::from("Exec Time"),
                     Line::from("Updated"),
+                    Line::from("Host"),
                 ]).style(Style::default().add_modifier(Modifier::BOLD)))
                 .block(Block::default().borders(Borders::ALL));
 
