@@ -24,8 +24,8 @@ impl Watcher {
         executor_id: i64,
         state: &State,
     ) -> Result<MessageReport, JobError> {
-        let lag = state.rng.write().await.random_range(0..100000);
-        let execution_time = state.rng.write().await.random_range(0.0..1000.0);
+        let lag = state.rng.write().await.random_range(0..11000);
+        let execution_time = state.rng.write().await.random_range(0.0..1500.0);
 
         let report = MessageReport {
             tenant: tenant.into(),

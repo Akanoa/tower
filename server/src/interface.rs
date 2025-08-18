@@ -2,14 +2,42 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Row, Table};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use protocol::{Message, MessageBody, MessageRegister, MessageReport, MessageUnregister};
+
+// Resample a u64 series to exactly `width` points for visual stretching in sparklines
+fn resample_to_width_u64(values: &[u64], width: usize) -> Vec<u64> {
+    if width == 0 {
+        return Vec::new();
+    }
+    if values.is_empty() {
+        return vec![0; width];
+    }
+    if values.len() == 1 {
+        return vec![values[0]; width];
+    }
+    let src_len = values.len();
+    let dst_len = width;
+    let mut out = Vec::with_capacity(dst_len);
+    let denom = (dst_len - 1) as f64;
+    let src_max = (src_len - 1) as f64;
+    for i in 0..dst_len {
+        let pos = if denom == 0.0 {
+            0.0
+        } else {
+            (i as f64) * (src_max / denom)
+        };
+        let idx = pos.round().clamp(0.0, src_max) as usize;
+        out.push(values[idx]);
+    }
+    out
+}
 
 pub type MessageReceiver = mpsc::UnboundedReceiver<Message>;
 
@@ -169,8 +197,16 @@ impl AppState {
     // Build visible rows respecting folding
     pub fn visible_rows(&self) -> Vec<Row<'static>> {
         let mut rows = Vec::new();
-        let tenant_filt = if self.filter.is_empty() { None } else { Some(self.filter.to_lowercase()) };
-        let host_filt = if self.host_filter.is_empty() { None } else { Some(self.host_filter.to_lowercase()) };
+        let tenant_filt = if self.filter.is_empty() {
+            None
+        } else {
+            Some(self.filter.to_lowercase())
+        };
+        let host_filt = if self.host_filter.is_empty() {
+            None
+        } else {
+            Some(self.host_filter.to_lowercase())
+        };
         for (tenant_name, tenant) in &self.tenants {
             if let Some(ref f) = tenant_filt {
                 if !tenant_name.to_lowercase().contains(f) {
@@ -217,11 +253,25 @@ impl AppState {
             };
             rows.push(
                 Row::new(vec![
-                    Line::from(format!("{t_prefix} Tenant: {tenant_name}")),
-                    Line::from(format!("{}", tenant_mean_lag)),
-                    Line::from(format!("{:.3} ms", tenant_mean_exec)),
-                    Line::from(""),
-                    Line::from(""),
+                    Cell::from(Line::from(format!("{t_prefix} Tenant: {tenant_name}"))),
+                    {
+                        let style = if tenant_mean_lag > 10_000 {
+                            Style::default().fg(Color::Red)
+                        } else {
+                            Style::default()
+                        };
+                        Cell::from(Line::from(format!("{}", tenant_mean_lag))).style(style)
+                    },
+                    {
+                        let style = if tenant_mean_exec > 1000.0 {
+                            Style::default().fg(Color::Red)
+                        } else {
+                            Style::default()
+                        };
+                        Cell::from(Line::from(format!("{:.3} ms", tenant_mean_exec))).style(style)
+                    },
+                    Cell::from(Line::from("")),
+                    Cell::from(Line::from("")),
                 ])
                 .style(Style::default().add_modifier(Modifier::BOLD)),
             );
@@ -240,25 +290,54 @@ impl AppState {
                     (0u64, 0.0f64)
                 };
                 rows.push(Row::new(vec![
-                    Line::from(format!("{e_prefix} Executor #{}", exec_id.0)), 
-                    Line::from(format!("{}", mean_lag)),
-                    Line::from(format!("{:.3} ms", mean_exec)),
-                    Line::from(""),
-                    Line::from(exec.host.clone()),
+                    Cell::from(Line::from(format!("{e_prefix} Executor #{}", exec_id.0))),
+                    {
+                        let style = if mean_lag > 10_000 {
+                            Style::default().fg(Color::Red)
+                        } else {
+                            Style::default()
+                        };
+                        Cell::from(Line::from(format!("{}", mean_lag))).style(style)
+                    },
+                    {
+                        let style = if mean_exec > 1000.0 {
+                            Style::default().fg(Color::Red)
+                        } else {
+                            Style::default()
+                        };
+                        Cell::from(Line::from(format!("{:.3} ms", mean_exec))).style(style)
+                    },
+                    Cell::from(Line::from("")),
+                    Cell::from(Line::from(exec.host.clone())),
                 ]));
                 if exec.folded {
                     continue;
                 }
                 for (_watch_id, watch) in &exec.watchers {
                     rows.push(Row::new(vec![
-                        Line::from(format!("      Watch #{:}", watch.watch_id)),
-                        Line::from(format!("{}", watch.lag)),
-                        Line::from(format!("{:.3} ms", watch.execution_time)),
-                        Line::from(format!(
+                        Cell::from(Line::from(format!("      Watch #{:}", watch.watch_id))),
+                        {
+                            let style = if watch.lag > 10_000 {
+                                Style::default().fg(Color::Red)
+                            } else {
+                                Style::default()
+                            };
+                            Cell::from(Line::from(format!("{}", watch.lag))).style(style)
+                        },
+                        {
+                            let style = if watch.execution_time > 1000.0 {
+                                Style::default().fg(Color::Red)
+                            } else {
+                                Style::default()
+                            };
+                            Cell::from(Line::from(format!("{:.3} ms", watch.execution_time)))
+                                .style(style)
+                        },
+                        Cell::from(Line::from(format!(
                             "{:?}",
                             Instant::now().saturating_duration_since(watch.updated_at)
-                        )),
-                        Line::from(""),
+                        ))),
+                        Cell::from(Line::from("")),
                     ]));
                 }
             }
@@ -269,37 +348,59 @@ impl AppState {
     // Toggle fold state for the item at the visible index, if it's a tenant or executor row
     pub fn toggle_fold_at(&mut self, index: usize) {
         let mut i = 0usize;
-        let tenant_filt = if self.filter.is_empty() { None } else { Some(self.filter.to_lowercase()) };
-        let host_filt = if self.host_filter.is_empty() { None } else { Some(self.host_filter.to_lowercase()) };
+        let tenant_filt = if self.filter.is_empty() {
+            None
+        } else {
+            Some(self.filter.to_lowercase())
+        };
+        let host_filt = if self.host_filter.is_empty() {
+            None
+        } else {
+            Some(self.host_filter.to_lowercase())
+        };
         for (tenant_name, tenant) in self.tenants.iter_mut() {
             if let Some(ref f) = tenant_filt {
-                if !tenant_name.to_lowercase().contains(f) { continue; }
+                if !tenant_name.to_lowercase().contains(f) {
+                    continue;
+                }
             }
             // determine if tenant has any execs visible under host filter
             let mut any_exec_visible = false;
             for (_eid, e) in tenant.executors.iter() {
-                if host_filt.as_ref().map(|hf| e.host.to_lowercase().contains(hf)).unwrap_or(true) {
+                if host_filt
+                    .as_ref()
+                    .map(|hf| e.host.to_lowercase().contains(hf))
+                    .unwrap_or(true)
+                {
                     any_exec_visible = true;
                     break;
                 }
             }
-            if !any_exec_visible { continue; }
+            if !any_exec_visible {
+                continue;
+            }
             if i == index {
                 tenant.folded = !tenant.folded;
                 return;
             }
             i += 1;
-            if tenant.folded { continue; }
+            if tenant.folded {
+                continue;
+            }
             for (_exec_id, exec) in tenant.executors.iter_mut() {
                 if let Some(ref hf) = host_filt {
-                    if !exec.host.to_lowercase().contains(hf) { continue; }
+                    if !exec.host.to_lowercase().contains(hf) {
+                        continue;
+                    }
                 }
                 if i == index {
                     exec.folded = !exec.folded;
                     return;
                 }
                 i += 1;
-                if exec.folded { continue; }
+                if exec.folded {
+                    continue;
+                }
                 // skip watcher rows
                 i += exec.watchers.len();
             }
@@ -309,8 +410,16 @@ impl AppState {
     // Resolve current selection to a watcher identifier if selection points to a watcher row
     pub fn selected_watch_ids(&self) -> Option<(String, (i64, String), i64)> {
         let mut i = 0usize;
-        let tenant_filt = if self.filter.is_empty() { None } else { Some(self.filter.to_lowercase()) };
-        let host_filt = if self.host_filter.is_empty() { None } else { Some(self.host_filter.to_lowercase()) };
+        let tenant_filt = if self.filter.is_empty() {
+            None
+        } else {
+            Some(self.filter.to_lowercase())
+        };
+        let host_filt = if self.host_filter.is_empty() {
+            None
+        } else {
+            Some(self.host_filter.to_lowercase())
+        };
         for (tenant_name, tenant) in &self.tenants {
             if let Some(ref f) = tenant_filt {
                 if !tenant_name.to_lowercase().contains(f) {
@@ -320,11 +429,18 @@ impl AppState {
             // Only consider tenants with at least one visible executor under host filter
             let mut any_exec_visible = false;
             for (_eid, e) in tenant.executors.iter() {
-                if host_filt.as_ref().map(|hf| e.host.to_lowercase().contains(hf)).unwrap_or(true) {
-                    any_exec_visible = true; break;
+                if host_filt
+                    .as_ref()
+                    .map(|hf| e.host.to_lowercase().contains(hf))
+                    .unwrap_or(true)
+                {
+                    any_exec_visible = true;
+                    break;
                 }
             }
-            if !any_exec_visible { continue; }
+            if !any_exec_visible {
+                continue;
+            }
             if i == self.selected {
                 // tenant row selected
                 return None;
@@ -335,7 +451,9 @@ impl AppState {
             }
             for (exec_id, exec) in &tenant.executors {
                 if let Some(ref hf) = host_filt {
-                    if !exec.host.to_lowercase().contains(hf) { continue; }
+                    if !exec.host.to_lowercase().contains(hf) {
+                        continue;
+                    }
                 }
                 if i == self.selected {
                     return None;
@@ -449,7 +567,7 @@ pub async fn run_tui(
             if let Some((ref tenant_name, exec_key, watch_id)) = selected_watch {
                 let main_chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Percentage(60), Constraint::Percentage(40)].as_ref())
+                    .constraints([Constraint::Percentage(40), Constraint::Percentage(60)].as_ref())
                     .split(chunks[1]);
                 // render table in top part
                 f.render_widget(&table, main_chunks[0]);
@@ -501,106 +619,105 @@ pub async fn run_tui(
                                 .split(detail_inner[0]);
                             f.render_widget(detail_block.clone(), lag_chunks[0]);
 
-                            // Lag chart (no X labels to avoid duplication; Y labels shown)
+                            // Lag sparkline with manual Y-axis labels (no X labels here)
+                            let lag_area = lag_chunks[1];
+                            let lag_layout = Layout::default()
+                                .direction(Direction::Horizontal)
+                                .constraints([Constraint::Length(8), Constraint::Min(0)].as_ref())
+                                .split(lag_area);
+                            // Y-axis labels at left (top/mid/bottom)
                             let y_max_lag = watch.lag_hist.iter().copied().max().unwrap_or(1) as f64;
-                            let lag_chart = if lag_points.is_empty() {
-                                Chart::new(vec![] as Vec<Dataset>)
-                                    .block(Block::default().title("Lag message over time").borders(Borders::ALL))
-                                    .x_axis(
-                                        Axis::default()
-                                            .bounds([
-                                                (x_upper - 10.0).max(0.0),
-                                                x_upper,
-                                            ])
-                                    )
-                                    .y_axis(
-                                        Axis::default()
-                                            .bounds([0.0, 1.0])
-                                            .labels(vec![Span::from("0"), Span::from("0.5"), Span::from("1.0")])
-                                    )
-                            } else {
-                                Chart::new(vec![
-                                    Dataset::default()
-                                        .name("Lag")
-                                        .graph_type(GraphType::Line)
-                                        .data(&lag_points),
-                                ])
-                                .block(Block::default().title("Lag message over time").borders(Borders::ALL))
-                                .x_axis(
-                                    Axis::default()
-                                        .bounds([x_min_ts, x_upper])
-                                )
-                                .y_axis(
-                                    Axis::default()
-                                        .bounds([0.0, y_max_lag.max(1.0)])
-                                        .labels({
-                                            let max = y_max_lag.max(1.0);
-                                            vec![Span::from("0"), Span::from(format!("{:.0}", max/2.0)), Span::from(format!("{:.0}", max))]
-                                        })
-                                )
-                            };
-                            f.render_widget(lag_chart, lag_chunks[1]);
+                            let y_left = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)].as_ref())
+                                .split(lag_layout[0]);
+                            let top_lbl = format!("{:.0}", y_max_lag.max(1.0));
+                            let mid_lbl = format!("{:.0}", y_max_lag.max(1.0) / 2.0);
+                            let bot_lbl = String::from("0");
+                            f.render_widget(Paragraph::new(Line::from(top_lbl)), y_left[0]);
+                            // Center the middle label vertically within its area
+                            let mid_center = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([Constraint::Min(0), Constraint::Length(1), Constraint::Min(0)].as_ref())
+                                .split(y_left[1]);
+                            f.render_widget(Paragraph::new(Line::from(mid_lbl)), mid_center[1]);
+                            f.render_widget(Paragraph::new(Line::from(bot_lbl)), y_left[2]);
+                            // Plot area with sparkline
+                            let lag_block = Block::default().title("Lag message over time").borders(Borders::ALL);
+                            let lag_inner = lag_block.inner(lag_layout[1]);
+                            f.render_widget(lag_block, lag_layout[1]);
+                            let lag_vals_src: Vec<u64> = watch.lag_hist.iter().copied().collect();
+                            let lag_max = lag_vals_src.iter().copied().max().unwrap_or(1);
+                            let lag_vals = resample_to_width_u64(&lag_vals_src, lag_inner.width as usize);
+                            let lag_spark = Sparkline::default()
+                                .data(&lag_vals)
+                                .max(lag_max)
+                                .style(Style::default().fg(Color::Red));
+                            f.render_widget(lag_spark, lag_inner);
 
-                            // Exec time chart (shows human-readable time on X axis)
+                            // Exec time sparkline with manual Y-axis and X-axis labels (human-readable time)
+                            // Layout: top row is plot (with left Y labels and right sparkline in a block), bottom row is X labels
+                            let exec_area = detail_inner[1];
+                            let exec_v = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([Constraint::Min(0), Constraint::Length(1)].as_ref())
+                                .split(exec_area);
+                            // Row for plot: split y labels and sparkline
+                            let exec_row = Layout::default()
+                                .direction(Direction::Horizontal)
+                                .constraints([Constraint::Length(8), Constraint::Min(0)].as_ref())
+                                .split(exec_v[0]);
+                            // Y-axis labels
                             let y_max_exec = watch.exec_hist.iter().cloned().fold(0.0_f64, f64::max);
-                            let exec_chart = if exec_points.is_empty() {
-                                Chart::new(vec![] as Vec<Dataset>)
-                                    .block(Block::default().title("Exec Time (ms)").borders(Borders::ALL))
-                                    .x_axis(
-                                        Axis::default()
-                                            .bounds([
-                                                (x_upper - 10.0).max(0.0),
-                                                x_upper,
-                                            ])
-                                            .labels({
-                                                use chrono::{Local, TimeZone};
-                                                let x0 = (x_upper - 10.0).max(0.0);
-                                                let mid = (x0 + x_upper) / 2.0;
-                                                let fmt = |ts: f64| -> String {
-                                                    let secs = ts.floor() as i64;
-                                                    let dt = match Local.timestamp_opt(secs, 0) { chrono::LocalResult::Single(dt) => dt, _ => Local.timestamp(0, 0) };
-                                                    dt.format("%H:%M:%S").to_string()
-                                                };
-                                                vec![Span::from(fmt(x0)), Span::from(fmt(mid)), Span::from(fmt(x_upper))]
-                                            })
-                                    )
-                                    .y_axis(
-                                        Axis::default()
-                                            .bounds([0.0, 1.0])
-                                            .labels(vec![Span::from("0"), Span::from("0.5"), Span::from("1.0")])
-                                    )
-                            } else {
-                                Chart::new(vec![
-                                    Dataset::default()
-                                        .name("Exec ms")
-                                        .graph_type(GraphType::Line)
-                                        .data(&exec_points),
-                                ])
-                                .block(Block::default().title("Exec Time (ms)").borders(Borders::ALL))
-                                .x_axis(
-                                    Axis::default()
-                                        .bounds([x_min_ts, x_upper])
-                                        .labels({
-                                            use chrono::{Local, TimeZone};
-                                            let mid = (x_min_ts + x_upper) / 2.0;
-                                            let fmt = |ts: f64| -> String {
-                                                let secs = ts.floor() as i64;
-                                                let dt = match Local.timestamp_opt(secs, 0) { chrono::LocalResult::Single(dt) => dt, _ => Local.timestamp(0, 0) };
-                                                dt.format("%H:%M:%S").to_string()
-                                            };
-                                            vec![Span::from(fmt(x_min_ts)), Span::from(fmt(mid)), Span::from(fmt(x_upper))]
-                                        })
-                                )
-                                .y_axis(
-                                    Axis::default()
-                                        .bounds([0.0, y_max_exec.max(1.0)])
-                                        .labels({
-                                            let max = y_max_exec.max(1.0);
-                                            vec![Span::from("0"), Span::from(format!("{:.0}", max/2.0)), Span::from(format!("{:.0}", max))]
-                                        })
-                                )
+                            let y_left_e = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)].as_ref())
+                                .split(exec_row[0]);
+                            let top_e = format!("{:.0}", y_max_exec.max(1.0));
+                            let mid_e = format!("{:.0}", y_max_exec.max(1.0) / 2.0);
+                            let bot_e = String::from("0");
+                            f.render_widget(Paragraph::new(Line::from(top_e)), y_left_e[0]);
+                            // Center the middle label vertically within its area
+                            let mid_center_e = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([Constraint::Min(0), Constraint::Length(1), Constraint::Min(0)].as_ref())
+                                .split(y_left_e[1]);
+                            f.render_widget(Paragraph::new(Line::from(mid_e)), mid_center_e[1]);
+                            f.render_widget(Paragraph::new(Line::from(bot_e)), y_left_e[2]);
+                            // Sparkline plot with block
+                            let exec_block = Block::default().title("Exec Time (ms)").borders(Borders::ALL);
+                            let exec_inner = exec_block.inner(exec_row[1]);
+                            f.render_widget(exec_block, exec_row[1]);
+                            let exec_vals_src: Vec<u64> = watch.exec_hist.iter().map(|v| v.max(0.0).round() as u64).collect();
+                            let exec_max = exec_vals_src.iter().copied().max().unwrap_or(1);
+                            let exec_vals = resample_to_width_u64(&exec_vals_src, exec_inner.width as usize);
+                            let exec_spark = Sparkline::default()
+                                .data(&exec_vals)
+                                .max(exec_max)
+                                .style(Style::default().fg(Color::Green));
+                            f.render_widget(exec_spark, exec_inner);
+                            // X-axis human-readable time labels under the plot, centered in thirds
+                            use chrono::{Local, TimeZone};
+                            let fmt_time = |ts: f64| -> String {
+                                let secs = ts.floor() as i64;
+                                let dt = match Local.timestamp_opt(secs, 0) { chrono::LocalResult::Single(dt) => dt, _ => Local.timestamp(0, 0) };
+                                dt.format("%H:%M:%S").to_string()
                             };
-                            f.render_widget(exec_chart, detail_inner[1]);
+                            let mid_ts = (x_min_ts + x_upper) / 2.0;
+                            let labels_row = Layout::default()
+                                .direction(Direction::Horizontal)
+                                .constraints([
+                                    Constraint::Percentage(33),
+                                    Constraint::Percentage(34),
+                                    Constraint::Percentage(33),
+                                ].as_ref())
+                                .split(exec_v[1]);
+                            let left_lbl = Paragraph::new(Line::from(fmt_time(x_min_ts))).alignment(Alignment::Center);
+                            let mid_lbl = Paragraph::new(Line::from(fmt_time(mid_ts))).alignment(Alignment::Center);
+                            let right_lbl = Paragraph::new(Line::from(fmt_time(x_upper))).alignment(Alignment::Center);
+                            f.render_widget(left_lbl, labels_row[0]);
+                            f.render_widget(mid_lbl, labels_row[1]);
+                            f.render_widget(right_lbl, labels_row[2]);
                         } else {
                             // watcher missing
                         }
@@ -623,7 +740,10 @@ pub async fn run_tui(
                     use ratatui::crossterm::event::KeyCode;
                     if filtering || filtering_host {
                         match key.code {
-                            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('/') | KeyCode::Char('q') => {
+                            KeyCode::Esc
+                            | KeyCode::Enter
+                            | KeyCode::Char('/')
+                            | KeyCode::Char('q') => {
                                 filtering = false;
                                 filtering_host = false;
                             }
