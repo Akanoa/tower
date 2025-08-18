@@ -77,6 +77,8 @@ pub struct AppState {
     pub filter: String,
     // current host filter (case-insensitive contains)
     pub host_filter: String,
+    // vertical scroll offset for the main table
+    pub scroll_offset: usize,
 }
 
 impl AppState {
@@ -472,6 +474,69 @@ impl AppState {
         }
         None
     }
+
+    // If selection is on a tenant row, return its name; otherwise None
+    pub fn selected_tenant_name(&self) -> Option<String> {
+        let mut i = 0usize;
+        let tenant_filt = if self.filter.is_empty() {
+            None
+        } else {
+            Some(self.filter.to_lowercase())
+        };
+        let host_filt = if self.host_filter.is_empty() {
+            None
+        } else {
+            Some(self.host_filter.to_lowercase())
+        };
+        for (tenant_name, tenant) in &self.tenants {
+            if let Some(ref f) = tenant_filt {
+                if !tenant_name.to_lowercase().contains(f) {
+                    continue;
+                }
+            }
+            // Consider only tenants with at least one visible executor under host filter
+            let mut any_exec_visible = false;
+            for (_eid, e) in tenant.executors.iter() {
+                if host_filt
+                    .as_ref()
+                    .map(|hf| e.host.to_lowercase().contains(hf))
+                    .unwrap_or(true)
+                {
+                    any_exec_visible = true;
+                    break;
+                }
+            }
+            if !any_exec_visible {
+                continue;
+            }
+            if i == self.selected {
+                // tenant row selected
+                return Some(tenant_name.clone());
+            }
+            i += 1;
+            if tenant.folded {
+                continue;
+            }
+            for (_exec_id, exec) in &tenant.executors {
+                if let Some(ref hf) = host_filt {
+                    if !exec.host.to_lowercase().contains(hf) {
+                        continue;
+                    }
+                }
+                if i == self.selected {
+                    // executor row selected
+                    return None;
+                }
+                i += 1;
+                if exec.folded {
+                    continue;
+                }
+                // skip watcher rows
+                i += exec.watchers.len();
+            }
+        }
+        None
+    }
 }
 
 pub async fn run_tui(
@@ -515,6 +580,7 @@ pub async fn run_tui(
         }
 
         let selected_watch = app.selected_watch_ids();
+        let selected_tenant = app.selected_tenant_name();
         terminal.draw(|f| {
             let size = f.area();
             let chunks = Layout::default()
@@ -532,19 +598,13 @@ pub async fn run_tui(
             let header = Block::default().title(header_title).borders(Borders::ALL);
             f.render_widget(header, chunks[0]);
 
-            // Build rows and apply highlight to the selected one
-            let mut rows = app.visible_rows();
+            // Build all rows
+            let rows_full = app.visible_rows();
             // Clamp selection if rows shrink (e.g., after folding)
-            if !rows.is_empty() && app.selected >= rows.len() {
-                app.selected = rows.len() - 1;
+            if !rows_full.is_empty() && app.selected >= rows_full.len() {
+                app.selected = rows_full.len() - 1;
             }
             let selected_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
-            let rows: Vec<Row<'static>> = rows
-                .into_iter()
-                .enumerate()
-                .map(|(i, row)| if i == app.selected { row.style(selected_style) } else { row })
-                .collect();
-
             let widths = [
                 Constraint::Percentage(40),
                 Constraint::Percentage(10),
@@ -553,24 +613,57 @@ pub async fn run_tui(
                 Constraint::Percentage(15),
             ];
 
-            let table = Table::new(rows, widths)
-                .header(Row::new(vec![
-                    Line::from("Name"),
-                    Line::from("Lag"),
-                    Line::from("Exec Time"),
-                    Line::from("Updated"),
-                    Line::from("Host"),
-                ]).style(Style::default().add_modifier(Modifier::BOLD)))
-                .block(Block::default().borders(Borders::ALL));
-
             // If a watcher is selected, show details pane with charts below the table
             if let Some((ref tenant_name, exec_key, watch_id)) = selected_watch {
                 let main_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Percentage(40), Constraint::Percentage(60)].as_ref())
                     .split(chunks[1]);
-                // render table in top part
-                f.render_widget(&table, main_chunks[0]);
+                // render paginated table in top part
+                {
+                    let table_area = main_chunks[0];
+                    // approximate inner height: 2 for borders, 1 for header row
+                    let page_size = table_area.height.saturating_sub(3) as usize;
+                    if page_size == 0 {
+                        // Render an empty table with header if no space
+                        let empty: Vec<Row<'static>> = Vec::new();
+                        let table = Table::new(empty, widths)
+                            .header(Row::new(vec![
+                                Line::from("Name"),
+                                Line::from("Lag"),
+                                Line::from("Exec Time"),
+                                Line::from("Updated"),
+                                Line::from("Host"),
+                            ]).style(Style::default().add_modifier(Modifier::BOLD)))
+                            .block(Block::default().borders(Borders::ALL));
+                        f.render_widget(table, table_area);
+                    } else {
+                        // Keep selected within scroll window
+                        if app.selected < app.scroll_offset {
+                            app.scroll_offset = app.selected;
+                        } else if app.selected >= app.scroll_offset + page_size {
+                            app.scroll_offset = app.selected + 1 - page_size;
+                        }
+                        let rows_slice: Vec<Row<'static>> = rows_full
+                            .iter()
+                            .cloned()
+                            .enumerate()
+                            .skip(app.scroll_offset)
+                            .take(page_size)
+                            .map(|(i, row)| if i == app.selected { row.clone().style(selected_style) } else { row })
+                            .collect();
+                        let table = Table::new(rows_slice, widths)
+                            .header(Row::new(vec![
+                                Line::from("Name"),
+                                Line::from("Lag"),
+                                Line::from("Exec Time"),
+                                Line::from("Updated"),
+                                Line::from("Host"),
+                            ]).style(Style::default().add_modifier(Modifier::BOLD)))
+                            .block(Block::default().borders(Borders::ALL));
+                        f.render_widget(table, table_area);
+                    }
+                }
 
                 // Render details in bottom part
                 if let Some(tenant) = app.tenants.get(tenant_name) {
@@ -727,9 +820,124 @@ pub async fn run_tui(
                 } else {
                     // tenant missing
                 }
+            } else if let Some(ref tenant_name) = selected_tenant {
+                // Tenant selected: show details summary below table
+                let main_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+                    .split(chunks[1]);
+                // render paginated table in top part
+                {
+                    let table_area = main_chunks[0];
+                    let page_size = table_area.height.saturating_sub(3) as usize;
+                    if page_size == 0 {
+                        let empty: Vec<Row<'static>> = Vec::new();
+                        let table = Table::new(empty, widths)
+                            .header(Row::new(vec![
+                                Line::from("Name"),
+                                Line::from("Lag"),
+                                Line::from("Exec Time"),
+                                Line::from("Updated"),
+                                Line::from("Host"),
+                            ]).style(Style::default().add_modifier(Modifier::BOLD)))
+                            .block(Block::default().borders(Borders::ALL));
+                        f.render_widget(table, table_area);
+                    } else {
+                        if app.selected < app.scroll_offset {
+                            app.scroll_offset = app.selected;
+                        } else if app.selected >= app.scroll_offset + page_size {
+                            app.scroll_offset = app.selected + 1 - page_size;
+                        }
+                        let rows_slice: Vec<Row<'static>> = rows_full
+                            .iter()
+                            .cloned()
+                            .enumerate()
+                            .skip(app.scroll_offset)
+                            .take(page_size)
+                            .map(|(i, row)| if i == app.selected { row.clone().style(selected_style) } else { row })
+                            .collect();
+                        let table = Table::new(rows_slice, widths)
+                            .header(Row::new(vec![
+                                Line::from("Name"),
+                                Line::from("Lag"),
+                                Line::from("Exec Time"),
+                                Line::from("Updated"),
+                                Line::from("Host"),
+                            ]).style(Style::default().add_modifier(Modifier::BOLD)))
+                            .block(Block::default().borders(Borders::ALL));
+                        f.render_widget(table, table_area);
+                    }
+                }
+
+                // compute tenant summary filtered by host
+                let mut num_exec = 0usize;
+                let mut num_watch = 0usize;
+                let mut sum_exec_time = 0.0f64;
+                let mut sum_lag: u128 = 0;
+                if let Some(tenant) = app.tenants.get(tenant_name) {
+                    let host_filt = if app.host_filter.is_empty() { None } else { Some(app.host_filter.to_lowercase()) };
+                    for (_k, exec) in &tenant.executors {
+                        if host_filt.as_ref().map(|hf| exec.host.to_lowercase().contains(hf)).unwrap_or(true) {
+                            num_exec += 1;
+                            num_watch += exec.watchers.len();
+                            for w in exec.watchers.values() {
+                                sum_exec_time += w.execution_time;
+                                sum_lag += w.lag as u128;
+                            }
+                        }
+                    }
+                }
+                let mean_exec = if num_watch > 0 { sum_exec_time / (num_watch as f64) } else { 0.0 };
+                let mean_lag: u64 = if num_watch > 0 { (sum_lag as f64 / num_watch as f64).round() as u64 } else { 0 };
+                let bullet = "•";
+                let details_text = format!(
+                    "{b} Number of executors: {ne}\n{b} Number of watchers: {nw}\n{b} Mean execution time: {me:.3} ms\n{b} Mean lag: {ml}",
+                    b=bullet, ne=num_exec, nw=num_watch, me=mean_exec, ml=mean_lag
+                );
+                let details = Paragraph::new(details_text)
+                    .block(Block::default().title(format!("Tenant details: {}", tenant_name)).borders(Borders::ALL));
+                f.render_widget(details, main_chunks[1]);
             } else {
-                // No watcher selected, render full-height table
-                f.render_widget(&table, chunks[1]);
+                // No watcher or tenant selected, render full-height table (paginated)
+                let table_area = chunks[1];
+                let page_size = table_area.height.saturating_sub(3) as usize;
+                if page_size == 0 {
+                    let empty: Vec<Row<'static>> = Vec::new();
+                    let table = Table::new(empty, widths)
+                        .header(Row::new(vec![
+                            Line::from("Name"),
+                            Line::from("Lag"),
+                            Line::from("Exec Time"),
+                            Line::from("Updated"),
+                            Line::from("Host"),
+                        ]).style(Style::default().add_modifier(Modifier::BOLD)))
+                        .block(Block::default().borders(Borders::ALL));
+                    f.render_widget(table, table_area);
+                } else {
+                    if app.selected < app.scroll_offset {
+                        app.scroll_offset = app.selected;
+                    } else if app.selected >= app.scroll_offset + page_size {
+                        app.scroll_offset = app.selected + 1 - page_size;
+                    }
+                    let rows_slice: Vec<Row<'static>> = rows_full
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .skip(app.scroll_offset)
+                        .take(page_size)
+                        .map(|(i, row)| if i == app.selected { row.clone().style(selected_style) } else { row })
+                        .collect();
+                    let table = Table::new(rows_slice, widths)
+                        .header(Row::new(vec![
+                            Line::from("Name"),
+                            Line::from("Lag"),
+                            Line::from("Exec Time"),
+                            Line::from("Updated"),
+                            Line::from("Host"),
+                        ]).style(Style::default().add_modifier(Modifier::BOLD)))
+                        .block(Block::default().borders(Borders::ALL));
+                    f.render_widget(table, table_area);
+                }
             }
         })?;
 
