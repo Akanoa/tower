@@ -9,7 +9,7 @@ use tracing::{error, info, warn};
 
 pub struct State {
     pub host: String,
-    pub executors: RwLock<BTreeMap<i64, Executor>>,
+    pub executors: RwLock<BTreeMap<(String, i64), Executor>>,
     pub(crate) rng: RwLock<StdRng>,
 }
 
@@ -35,7 +35,7 @@ impl State {
         self.executors
             .write()
             .await
-            .entry(executor_id)
+            .entry((tenant.to_string(), executor_id))
             .or_insert(Executor::new(tenant, executor_id))
             .watchers
             .insert(watcher_id, Watcher::new(watcher_id, interest));
@@ -56,15 +56,11 @@ impl State {
     ) -> Result<(), JobError> {
         let mut executor_guard = self.executors.write().await;
 
-        let Some(executor) = executor_guard.get_mut(&executor_id) else {
+        let key = (tenant.to_string(), executor_id);
+        let Some(executor) = executor_guard.get_mut(&key) else {
             error!(tenant, executor_id, "Executor not found");
             return Err(JobError::NotExistingExecutor(executor_id));
         };
-
-        if executor.tenant != tenant {
-            error!(tenant, executor_id, "Executor not found for tenant");
-            return Err(JobError::NotExistingExecutor(executor_id));
-        }
 
         match executor.watchers.remove(&watch_id) {
             None => {

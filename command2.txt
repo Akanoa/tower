@@ -1,4 +1,4 @@
 register "tenant 1" 42 "y > 3"
 register "tenant 2" 67 "tutu"
 register "tenant 2" 67 "titi"
-register "tenant 3" 43 "test"
+register "tenant 3" 42 "test"
