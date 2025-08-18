@@ -1,0 +1,2 @@
+register "tenant 1" 42 "x > 3"
+register "tenant 2" 68 "toto"

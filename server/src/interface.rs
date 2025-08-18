@@ -40,6 +40,8 @@ pub struct AppState {
     pub tenants: BTreeMap<String, TenantItem>,
     // index of currently selected visible row in flat view
     pub selected: usize,
+    // current tenant filter (case-insensitive contains)
+    pub filter: String,
 }
 
 impl AppState {
@@ -110,7 +112,17 @@ impl AppState {
     // Build visible rows respecting folding
     pub fn visible_rows(&self) -> Vec<Row<'static>> {
         let mut rows = Vec::new();
+        let filt = if self.filter.is_empty() {
+            None
+        } else {
+            Some(self.filter.to_lowercase())
+        };
         for (tenant_name, tenant) in &self.tenants {
+            if let Some(ref f) = filt {
+                if !tenant_name.to_lowercase().contains(f) {
+                    continue;
+                }
+            }
             let t_prefix = if tenant.folded { "▸" } else { "▾" };
             rows.push(
                 Row::new(vec![
@@ -199,6 +211,7 @@ pub async fn run_tui(
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = AppState::default();
+    let mut filtering = false;
 
     // UI loop
     loop {
@@ -218,7 +231,12 @@ pub async fn run_tui(
                 .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
                 .split(size);
 
-            let header = Block::default().title("Watchers by Tenant/Executor (q to quit, arrows to navigate, Enter/Right to fold/unfold)").borders(Borders::ALL);
+            let header_title = format!(
+                "Watchers by Tenant/Executor (q quit, / toggle filter, Esc/Enter exit filter, arrows navigate, Enter/Right fold/unfold) | Filter{}: {}",
+                if filtering { " [typing]" } else { "" },
+                if app.filter.is_empty() { "<none>".to_string() } else { app.filter.clone() }
+            );
+            let header = Block::default().title(header_title).borders(Borders::ALL);
             f.render_widget(header, chunks[0]);
 
             // Build rows and apply highlight to the selected one
@@ -256,24 +274,64 @@ pub async fn run_tui(
         // Input handling with small timeout to keep UI responsive
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(key) => match key.code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Down => {
-                        let max = app.visible_rows().len();
-                        if app.selected + 1 < max {
-                            app.selected += 1;
+                Event::Key(key) => {
+                    use ratatui::crossterm::event::KeyCode;
+                    if filtering {
+                        match key.code {
+                            KeyCode::Esc => {
+                                filtering = false;
+                            }
+                            KeyCode::Enter => {
+                                filtering = false;
+                            }
+                            KeyCode::Char('/') => {
+                                // Toggle filtering off with '/'
+                                filtering = false;
+                            }
+                            KeyCode::Char('q') => {
+                                // Do not quit app while typing; just exit filtering mode
+                                filtering = false;
+                            }
+                            KeyCode::Backspace => {
+                                app.filter.pop();
+                                app.selected = 0;
+                            }
+                            KeyCode::Char(c) => {
+                                // Accept most visible characters for the filter
+                                if !c.is_control() {
+                                    app.filter.push(c);
+                                    app.selected = 0;
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Char('q') => break,
+                            KeyCode::Char('/') => {
+                                filtering = true;
+                                // keep existing filter so user can refine; to start fresh uncomment next line
+                                // app.filter.clear();
+                                app.selected = 0;
+                            }
+                            KeyCode::Down => {
+                                let max = app.visible_rows().len();
+                                if app.selected + 1 < max {
+                                    app.selected += 1;
+                                }
+                            }
+                            KeyCode::Up => {
+                                if app.selected > 0 {
+                                    app.selected -= 1;
+                                }
+                            }
+                            KeyCode::Right | KeyCode::Enter | KeyCode::Left => {
+                                app.toggle_fold_at(app.selected);
+                            }
+                            _ => {}
                         }
                     }
-                    KeyCode::Up => {
-                        if app.selected > 0 {
-                            app.selected -= 1;
-                        }
-                    }
-                    KeyCode::Right | KeyCode::Enter | KeyCode::Left => {
-                        app.toggle_fold_at(app.selected);
-                    }
-                    _ => {}
-                },
+                }
                 Event::Resize(_, _) => {}
                 _ => {}
             }
