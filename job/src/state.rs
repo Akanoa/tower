@@ -14,7 +14,7 @@ pub struct State {
 }
 
 impl State {
-    pub(crate) fn new(host: &str) -> Self {
+    pub(crate) fn new(host: String) -> Self {
         State {
             host: host.to_string(),
             executors: Default::default(),

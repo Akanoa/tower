@@ -38,7 +38,7 @@ pub struct ExecutorItem {
 pub struct TenantItem {
     pub tenant: String,
     pub folded: bool,
-    pub executors: BTreeMap<i64, ExecutorItem>,
+    pub executors: BTreeMap<(i64, String), ExecutorItem>,
 }
 
 #[derive(Debug, Default)]
@@ -48,6 +48,8 @@ pub struct AppState {
     pub selected: usize,
     // current tenant filter (case-insensitive contains)
     pub filter: String,
+    // current host filter (case-insensitive contains)
+    pub host_filter: String,
 }
 
 impl AppState {
@@ -62,7 +64,7 @@ impl AppState {
             });
         let exec_entry = tenant_entry
             .executors
-            .entry(report.executor_id)
+            .entry((report.executor_id, host.clone()))
             .or_insert_with(|| ExecutorItem {
                 executor_id: report.executor_id,
                 folded: false,
@@ -119,7 +121,7 @@ impl AppState {
             });
         let exec_entry = tenant_entry
             .executors
-            .entry(reg.executor_id)
+            .entry((reg.executor_id, host.clone()))
             .or_insert_with(|| ExecutorItem {
                 executor_id: reg.executor_id,
                 folded: false,
@@ -144,7 +146,7 @@ impl AppState {
 
     pub fn apply_unregister(&mut self, host: String, unreg: MessageUnregister) {
         if let Some(tenant) = self.tenants.get_mut(&unreg.tenant) {
-            if let Some(exec) = tenant.executors.get_mut(&unreg.executor_id) {
+            if let Some(exec) = tenant.executors.get_mut(&(unreg.executor_id, host.clone())) {
                 exec.host = host;
                 exec.watchers.remove(&unreg.watch_id);
             }
@@ -168,16 +170,27 @@ impl AppState {
     // Build visible rows respecting folding
     pub fn visible_rows(&self) -> Vec<Row<'static>> {
         let mut rows = Vec::new();
-        let filt = if self.filter.is_empty() {
-            None
-        } else {
-            Some(self.filter.to_lowercase())
-        };
+        let tenant_filt = if self.filter.is_empty() { None } else { Some(self.filter.to_lowercase()) };
+        let host_filt = if self.host_filter.is_empty() { None } else { Some(self.host_filter.to_lowercase()) };
         for (tenant_name, tenant) in &self.tenants {
-            if let Some(ref f) = filt {
+            if let Some(ref f) = tenant_filt {
                 if !tenant_name.to_lowercase().contains(f) {
                     continue;
                 }
+            }
+            // Compute which executors are visible under host filter
+            let exec_iter = tenant.executors.iter().filter(|(_id, exec)| {
+                if let Some(ref hf) = host_filt {
+                    exec.host.to_lowercase().contains(hf)
+                } else {
+                    true
+                }
+            });
+            // We need to peek whether there is any executor to show; collect ids temporarily
+            let visible_execs: Vec<(&(i64, String), &ExecutorItem)> = exec_iter.collect();
+            if visible_execs.is_empty() {
+                // Skip tenant entirely if no executor matches host filter
+                continue;
             }
             let t_prefix = if tenant.folded { "▸" } else { "▾" };
             rows.push(
@@ -193,7 +206,7 @@ impl AppState {
             if tenant.folded {
                 continue;
             }
-            for (exec_id, exec) in &tenant.executors {
+            for (exec_id, exec) in visible_execs {
                 let e_prefix = if exec.folded { "  ▸" } else { "  ▾" };
                 // Compute means from current watcher values
                 let n = exec.watchers.len() as f64;
@@ -205,7 +218,7 @@ impl AppState {
                     (0u64, 0.0f64)
                 };
                 rows.push(Row::new(vec![
-                    Line::from(format!("{e_prefix} Executor #{exec_id}")),
+                    Line::from(format!("{e_prefix} Executor #{}", exec_id.0)), 
                     Line::from(format!("{}", mean_lag)),
                     Line::from(format!("{:.3} ms", mean_exec)),
                     Line::from(""),
@@ -234,24 +247,37 @@ impl AppState {
     // Toggle fold state for the item at the visible index, if it's a tenant or executor row
     pub fn toggle_fold_at(&mut self, index: usize) {
         let mut i = 0usize;
-        for (_tenant_name, tenant) in self.tenants.iter_mut() {
+        let tenant_filt = if self.filter.is_empty() { None } else { Some(self.filter.to_lowercase()) };
+        let host_filt = if self.host_filter.is_empty() { None } else { Some(self.host_filter.to_lowercase()) };
+        for (tenant_name, tenant) in self.tenants.iter_mut() {
+            if let Some(ref f) = tenant_filt {
+                if !tenant_name.to_lowercase().contains(f) { continue; }
+            }
+            // determine if tenant has any execs visible under host filter
+            let mut any_exec_visible = false;
+            for (_eid, e) in tenant.executors.iter() {
+                if host_filt.as_ref().map(|hf| e.host.to_lowercase().contains(hf)).unwrap_or(true) {
+                    any_exec_visible = true;
+                    break;
+                }
+            }
+            if !any_exec_visible { continue; }
             if i == index {
                 tenant.folded = !tenant.folded;
                 return;
             }
             i += 1;
-            if tenant.folded {
-                continue;
-            }
+            if tenant.folded { continue; }
             for (_exec_id, exec) in tenant.executors.iter_mut() {
+                if let Some(ref hf) = host_filt {
+                    if !exec.host.to_lowercase().contains(hf) { continue; }
+                }
                 if i == index {
                     exec.folded = !exec.folded;
                     return;
                 }
                 i += 1;
-                if exec.folded {
-                    continue;
-                }
+                if exec.folded { continue; }
                 // skip watcher rows
                 i += exec.watchers.len();
             }
@@ -259,19 +285,24 @@ impl AppState {
     }
 
     // Resolve current selection to a watcher identifier if selection points to a watcher row
-    pub fn selected_watch_ids(&self) -> Option<(String, i64, i64)> {
+    pub fn selected_watch_ids(&self) -> Option<(String, (i64, String), i64)> {
         let mut i = 0usize;
-        let filt = if self.filter.is_empty() {
-            None
-        } else {
-            Some(self.filter.to_lowercase())
-        };
+        let tenant_filt = if self.filter.is_empty() { None } else { Some(self.filter.to_lowercase()) };
+        let host_filt = if self.host_filter.is_empty() { None } else { Some(self.host_filter.to_lowercase()) };
         for (tenant_name, tenant) in &self.tenants {
-            if let Some(ref f) = filt {
+            if let Some(ref f) = tenant_filt {
                 if !tenant_name.to_lowercase().contains(f) {
                     continue;
                 }
             }
+            // Only consider tenants with at least one visible executor under host filter
+            let mut any_exec_visible = false;
+            for (_eid, e) in tenant.executors.iter() {
+                if host_filt.as_ref().map(|hf| e.host.to_lowercase().contains(hf)).unwrap_or(true) {
+                    any_exec_visible = true; break;
+                }
+            }
+            if !any_exec_visible { continue; }
             if i == self.selected {
                 // tenant row selected
                 return None;
@@ -281,6 +312,9 @@ impl AppState {
                 continue;
             }
             for (exec_id, exec) in &tenant.executors {
+                if let Some(ref hf) = host_filt {
+                    if !exec.host.to_lowercase().contains(hf) { continue; }
+                }
                 if i == self.selected {
                     return None;
                 }
@@ -290,7 +324,7 @@ impl AppState {
                 }
                 for (watch_id, _watch) in &exec.watchers {
                     if i == self.selected {
-                        return Some((tenant_name.clone(), *exec_id, *watch_id));
+                        return Some((tenant_name.clone(), exec_id.clone(), *watch_id));
                     }
                     i += 1;
                 }
@@ -321,6 +355,7 @@ pub async fn run_tui(
 
     let mut app = AppState::default();
     let mut filtering = false;
+    let mut filtering_host = false;
     let mut last_prune = Instant::now();
 
     // UI loop
@@ -348,9 +383,11 @@ pub async fn run_tui(
                 .split(size);
 
             let header_title = format!(
-                "Watchers by Tenant/Executor (q quit, / toggle filter, Esc/Enter exit filter, arrows navigate, Enter/Right fold/unfold) | Filter{}: {}",
+                "Watchers by Tenant/Executor (q quit, / tenant filter, h host filter, Esc/Enter exit filter, arrows navigate, Enter/Right fold/unfold) | Tenant{}: {} | Host{}: {}",
                 if filtering { " [typing]" } else { "" },
-                if app.filter.is_empty() { "<none>".to_string() } else { app.filter.clone() }
+                if app.filter.is_empty() { "<none>".to_string() } else { app.filter.clone() },
+                if filtering_host { " [typing]" } else { "" },
+                if app.host_filter.is_empty() { "<none>".to_string() } else { app.host_filter.clone() }
             );
             let header = Block::default().title(header_title).borders(Borders::ALL);
             f.render_widget(header, chunks[0]);
@@ -387,7 +424,7 @@ pub async fn run_tui(
                 .block(Block::default().borders(Borders::ALL));
 
             // If a watcher is selected, show details pane with charts below the table
-            if let Some((ref tenant_name, exec_id, watch_id)) = selected_watch {
+            if let Some((ref tenant_name, exec_key, watch_id)) = selected_watch {
                 let main_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Percentage(60), Constraint::Percentage(40)].as_ref())
@@ -397,10 +434,13 @@ pub async fn run_tui(
 
                 // Render details in bottom part
                 if let Some(tenant) = app.tenants.get(tenant_name) {
-                    if let Some(exec) = tenant.executors.get(&exec_id) {
+                    if let Some(exec) = tenant.executors.get(&exec_key) {
                         if let Some(watch) = exec.watchers.get(&watch_id) {
                             let detail_title = format!(
-                                "Details: {tenant_name} / Exec #{exec_id} / Watch #{watch_id} | Interest: {}",
+                                "Details: {tenant_name} / Exec #{} @ {} / Watch #{} | Interest: {}",
+                                exec_key.0,
+                                exec_key.1,
+                                watch_id,
                                 if watch.interest.is_empty() { "<unknown>" } else { &watch.interest }
                             );
                             let detail_block = Block::default().title(detail_title).borders(Borders::ALL);
@@ -555,30 +595,27 @@ pub async fn run_tui(
             match event::read()? {
                 Event::Key(key) => {
                     use ratatui::crossterm::event::KeyCode;
-                    if filtering {
+                    if filtering || filtering_host {
                         match key.code {
-                            KeyCode::Esc => {
+                            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('/') | KeyCode::Char('q') => {
                                 filtering = false;
-                            }
-                            KeyCode::Enter => {
-                                filtering = false;
-                            }
-                            KeyCode::Char('/') => {
-                                // Toggle filtering off with '/'
-                                filtering = false;
-                            }
-                            KeyCode::Char('q') => {
-                                // Do not quit app while typing; just exit filtering mode
-                                filtering = false;
+                                filtering_host = false;
                             }
                             KeyCode::Backspace => {
-                                app.filter.pop();
+                                if filtering_host {
+                                    app.host_filter.pop();
+                                } else {
+                                    app.filter.pop();
+                                }
                                 app.selected = 0;
                             }
                             KeyCode::Char(c) => {
-                                // Accept most visible characters for the filter
                                 if !c.is_control() {
-                                    app.filter.push(c);
+                                    if filtering_host {
+                                        app.host_filter.push(c);
+                                    } else {
+                                        app.filter.push(c);
+                                    }
                                     app.selected = 0;
                                 }
                             }
@@ -589,8 +626,12 @@ pub async fn run_tui(
                             KeyCode::Char('q') => break,
                             KeyCode::Char('/') => {
                                 filtering = true;
-                                // keep existing filter so user can refine; to start fresh uncomment next line
-                                // app.filter.clear();
+                                filtering_host = false;
+                                app.selected = 0;
+                            }
+                            KeyCode::Char('h') => {
+                                filtering_host = true;
+                                filtering = false;
                                 app.selected = 0;
                             }
                             KeyCode::Down => {

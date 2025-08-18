@@ -23,6 +23,7 @@ trait Action {
 #[derive(clap::Parser)]
 struct Cli {
     file: Option<String>,
+    host: Option<String>,
 }
 
 const SOCKET_PATH: &str = "server.sock";
@@ -39,7 +40,9 @@ pub async fn run() {
     let socket = Arc::new(RwLock::new(socket));
 
     let mut buffer = vec![0; 1024];
-    let state = Arc::new(State::new("localhost:8080"));
+    let state = Arc::new(State::new(
+        args.host.unwrap_or("localhost:8080".to_string()),
+    ));
 
     if let Some(file) = args.file {
         handle_file(state.clone(), socket.clone(), file).await;
