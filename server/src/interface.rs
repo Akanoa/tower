@@ -193,11 +193,34 @@ impl AppState {
                 continue;
             }
             let t_prefix = if tenant.folded { "▸" } else { "▾" };
+            // Compute tenant-level means based on means of its visible executors (with watchers)
+            let (tenant_mean_lag, tenant_mean_exec) = {
+                let mut sum_mean_lag = 0.0_f64;
+                let mut sum_mean_exec = 0.0_f64;
+                let mut count = 0.0_f64;
+                for (_key, exec) in &visible_execs {
+                    let n = exec.watchers.len() as f64;
+                    if n > 0.0 {
+                        let sum_lag: u128 = exec.watchers.values().map(|w| w.lag as u128).sum();
+                        let sum_exec: f64 = exec.watchers.values().map(|w| w.execution_time).sum();
+                        let mean_lag = sum_lag as f64 / n;
+                        let mean_exec = sum_exec / n;
+                        sum_mean_lag += mean_lag;
+                        sum_mean_exec += mean_exec;
+                        count += 1.0;
+                    }
+                }
+                if count > 0.0 {
+                    ((sum_mean_lag / count).round() as u64, sum_mean_exec / count)
+                } else {
+                    (0u64, 0.0f64)
+                }
+            };
             rows.push(
                 Row::new(vec![
                     Line::from(format!("{t_prefix} Tenant: {tenant_name}")),
-                    Line::from(""),
-                    Line::from(""),
+                    Line::from(format!("{}", tenant_mean_lag)),
+                    Line::from(format!("{:.3} ms", tenant_mean_exec)),
                     Line::from(""),
                     Line::from(""),
                 ])
