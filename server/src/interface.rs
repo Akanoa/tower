@@ -1016,10 +1016,10 @@ pub async fn run_tui(
                     use ratatui::crossterm::event::KeyCode;
                     if filtering || filtering_host {
                         match key.code {
+                            KeyCode::Char('q') => break,
                             KeyCode::Esc
                             | KeyCode::Enter
-                            | KeyCode::Char('/')
-                            | KeyCode::Char('q') => {
+                            | KeyCode::Char('/') => {
                                 filtering = false;
                                 filtering_host = false;
                             }

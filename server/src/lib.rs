@@ -31,15 +31,20 @@ pub async fn run() -> Result<(), ServerError> {
 async fn handle_local(args: Local) -> Result<(), ServerError> {
     // channel to forward all messages to TUI
     let (tx, rx) = mpsc::unbounded_channel::<Message>();
-    // spawn TUI
+    // spawn server socket in background
+    let socket_path = args.socket.clone();
+    let force = args.force;
+    let tx_clone = tx.clone();
     tokio::spawn(async move {
-        if let Err(err) = interface::run_tui(rx, None).await {
-            error!(?err, "TUI exited with error");
-        }
+        let _ = server_unix_socket(&socket_path, force, tx_clone).await;
     });
 
-    server_unix_socket(&args.socket, args.force, tx).await?;
+    // run TUI in foreground; pressing 'q' will return
+    if let Err(err) = interface::run_tui(rx, None).await {
+        error!(?err, "TUI exited with error");
+    }
 
+    // When TUI exits, end the application (background task will be aborted as runtime shuts down)
     Ok(())
 }
 
@@ -64,20 +69,22 @@ async fn handle_aggregator(args: Aggregator) -> Result<(), ServerError> {
     // control channel for backend polling management
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<tcp_server::PollControl>();
 
-    // Prepare aggregator tab config for TUI
-    let backends_copy = args.backends.clone();
-    let tui_ctrl_tx = ctrl_tx.clone();
-
-    // spawn TUI
+    // Spawn backend polling in background
+    let backends_for_poll = args.backends.clone();
+    let tx_for_poll = tx.clone();
     tokio::spawn(async move {
-        let cfg = interface::AggregatorTabConfig { backends: backends_copy, control_tx: tui_ctrl_tx };
-        if let Err(err) = interface::run_tui(rx, Some(cfg)).await {
-            error!(?err, "TUI exited with error");
-        }
+        let _ = tcp_server::poll_backends(backends_for_poll, tx_for_poll, ctrl_rx).await;
     });
 
-    // Start restartable polling jobs for each backend address
-    tcp_server::poll_backends(args.backends, tx, ctrl_rx).await?;
+    // Prepare aggregator tab config for TUI (pass the only sender to TUI)
+    let tui_cfg = interface::AggregatorTabConfig { backends: args.backends.clone(), control_tx: ctrl_tx };
+
+    // Run TUI in foreground
+    if let Err(err) = interface::run_tui(rx, Some(tui_cfg)).await {
+        error!(?err, "TUI exited with error");
+    }
+
+    // When TUI exits, sender is dropped, control channel closes, and background task will stop; end application
     Ok(())
 }
 
