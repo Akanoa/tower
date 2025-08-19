@@ -73,15 +73,38 @@ async fn handle_connection(mut stream: TcpStream, buffer: CircularBuffer) {
 }
 
 pub async fn poll_backends(
-    backends: Vec<TcpStream>,
+    backends: Vec<(String, u16)>,
     tx: UnboundedSender<Message>,
 ) -> Result<(), ServerError> {
     let mut handles = vec![];
-    for mut backend in backends.into_iter() {
+    for (addr, port) in backends.into_iter() {
         let tx_clone = tx.clone();
-        // Spawn a task per backend to continuously read and forward messages
+        // Spawn a task per backend address that reconnects on failure
         let handle = tokio::spawn(async move {
-            let _ = poll_backend(&mut backend, tx_clone).await;
+            let mut backoff_secs: u64 = 1;
+            let max_backoff: u64 = 30;
+            loop {
+                match tokio::net::TcpStream::connect(format!("{}:{}", addr, port)).await {
+                    Ok(mut stream) => {
+                        info!(backend = %format!("{}:{}", addr, port), "Connected to backend");
+                        // Reset backoff after a successful connection
+                        backoff_secs = 1;
+                        // Poll until disconnection or error
+                        if let Err(err) = poll_backend(&mut stream, tx_clone.clone()).await {
+                            warn!(?err, backend = %format!("{}:{}", addr, port), "Polling error, will reconnect");
+                        } else {
+                            warn!(backend = %format!("{}:{}", addr, port), "Backend disconnected, will reconnect");
+                        }
+                    }
+                    Err(err) => {
+                        warn!(?err, backend = %format!("{}:{}", addr, port), "Failed to connect to backend");
+                        // fall through to backoff sleep
+                    }
+                }
+                // Backoff before retrying
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = std::cmp::min(backoff_secs.saturating_mul(2), max_backoff);
+            }
         });
         handles.push(handle);
     }

@@ -2,7 +2,7 @@ use crate::cli::{Action, Aggregator, Cli, Local, Proxy};
 use crate::error::ServerError;
 use clap::Parser;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::net::{TcpStream, UnixListener, UnixStream};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::select;
 use tracing::{debug, error, info, warn};
 
@@ -68,15 +68,8 @@ async fn handle_aggregator(args: Aggregator) -> Result<(), ServerError> {
         }
     });
 
-    let mut backends = vec![];
-    for (addr, port) in args.backends {
-        let stream = TcpStream::connect(format!("{}:{}", addr, port)).await;
-        if let Ok(stream) = stream {
-            backends.push(stream);
-        }
-    }
-
-    tcp_server::poll_backends(backends, tx).await?;
+    // Start restartable polling jobs for each backend address
+    tcp_server::poll_backends(args.backends, tx).await?;
     Ok(())
 }
 
