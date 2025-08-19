@@ -22,8 +22,12 @@ trait Action {
 
 #[derive(clap::Parser)]
 struct Cli {
+    #[clap(long)]
     file: Option<String>,
+    #[clap(long)]
     host: Option<String>,
+    #[clap(long)]
+    socket: Option<String>,
 }
 
 const SOCKET_PATH: &str = "server.sock";
@@ -33,7 +37,7 @@ pub async fn run() {
 
     let args = Cli::parse();
 
-    let socket = UnixStream::connect(SOCKET_PATH)
+    let socket = UnixStream::connect(args.socket.unwrap_or(SOCKET_PATH.to_string()))
         .await
         .expect("Failed to connect to socket");
 

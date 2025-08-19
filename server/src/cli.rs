@@ -55,5 +55,5 @@ fn parse_backend(s: &str) -> Result<(String, u16), String> {
 #[derive(Debug, clap::Parser)]
 pub struct Aggregator {
     #[clap(long, short = 'b', value_parser = parse_backend)]
-    backends: Vec<(String, u16)>,
+    pub backends: Vec<(String, u16)>,
 }

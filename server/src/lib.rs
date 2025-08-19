@@ -1,8 +1,8 @@
-use crate::cli::{Action, Cli, Local};
+use crate::cli::{Action, Aggregator, Cli, Local, Proxy};
 use crate::error::ServerError;
 use clap::Parser;
-use tokio::io::AsyncReadExt;
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::select;
 use tracing::{debug, error, info, warn};
 
@@ -11,36 +11,26 @@ mod error;
 mod interface;
 mod tcp_server;
 
+use protocol::Message;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::UnboundedSender;
 
-pub async fn run() -> Result<(), error::ServerError> {
+pub async fn run() -> Result<(), ServerError> {
     let _ = tracing_subscriber::fmt::init();
     let args = Cli::parse();
 
     match args.command {
         Action::Local(local) => handle_local(local).await?,
-        Action::Aggregator(_) => {}
-        Action::Proxy(_) => {}
+        Action::Aggregator(aggregator) => handle_aggregator(aggregator).await?,
+        Action::Proxy(proxy) => handle_proxy(proxy).await?,
     }
 
     Ok(())
 }
 
-async fn handle_local(args: Local) -> Result<(), error::ServerError> {
-    if std::fs::exists(&args.socket)? {
-        if args.force {
-            debug!("Removing previous socket file");
-            std::fs::remove_file(&args.socket)?;
-        } else {
-            error!("Server already running, please use --force to remove previous socket file");
-            return Err(ServerError::SocketAlreadyExist(args.socket));
-        }
-    }
-
-    let server = UnixListener::bind(&args.socket)?;
-
+async fn handle_local(args: Local) -> Result<(), ServerError> {
     // channel to forward all messages to TUI
-    let (tx, rx) = mpsc::unbounded_channel::<protocol::Message>();
+    let (tx, rx) = mpsc::unbounded_channel::<Message>();
     // spawn TUI
     tokio::spawn(async move {
         if let Err(err) = interface::run_tui(rx).await {
@@ -48,15 +38,73 @@ async fn handle_local(args: Local) -> Result<(), error::ServerError> {
         }
     });
 
+    server_unix_socket(&args.socket, args.force, tx).await?;
+
+    Ok(())
+}
+
+async fn handle_proxy(args: Proxy) -> Result<(), ServerError> {
+    // channel to forward all messages to tcp server
+    let (tx, rx) = mpsc::unbounded_channel::<Message>();
+    // spawn tcp_server
+    tokio::spawn(async move {
+        if let Err(err) = tcp_server::start(&args.address, args.port, rx).await {
+            error!(?err, "TUI exited with error");
+        }
+    });
+
+    server_unix_socket(&args.socket, args.force, tx).await?;
+
+    Ok(())
+}
+
+async fn handle_aggregator(args: Aggregator) -> Result<(), ServerError> {
+    // channel to forward all messages to TUI
+    let (tx, rx) = mpsc::unbounded_channel::<Message>();
+    // spawn TUI
+    tokio::spawn(async move {
+        if let Err(err) = interface::run_tui(rx).await {
+            error!(?err, "TUI exited with error");
+        }
+    });
+
+    let mut backends = vec![];
+    for (addr, port) in args.backends {
+        let stream = TcpStream::connect(format!("{}:{}", addr, port)).await;
+        if let Ok(stream) = stream {
+            backends.push(stream);
+        }
+    }
+
+    tcp_server::poll_backends(backends, tx).await?;
+    Ok(())
+}
+
+async fn server_unix_socket(
+    socket: &str,
+    force: bool,
+    tx: UnboundedSender<Message>,
+) -> Result<(), ServerError> {
+    if std::fs::exists(socket)? {
+        if force {
+            debug!("Removing previous socket file");
+            std::fs::remove_file(&socket)?;
+        } else {
+            error!("Server already running, please use --force to remove previous socket file");
+            return Err(ServerError::SocketAlreadyExist(socket.to_string()));
+        }
+    }
+
+    let server = UnixListener::bind(&socket)?;
+
     loop {
         select! {
             result = server.accept() => {
                 match result {
                     Ok((socket, _addr)) => {
-                        // info!("new connection from {:?}", socket);
-                        let tx2 = tx.clone();
+                        let tx = tx.clone();
                         tokio::spawn(async move {
-                            let _ = handle_connection(socket, tx2).await;
+                            let _ = handle_connection_remote_connection(socket, tx).await;
                         });
                     },
                     Err(error) => {
@@ -73,19 +121,14 @@ async fn handle_local(args: Local) -> Result<(), error::ServerError> {
     Ok(())
 }
 
-async fn handle_connection(
-    stream: UnixStream,
-    tx: mpsc::UnboundedSender<protocol::Message>,
-) -> Result<(), error::ServerError> {
-    // info!(peer=?stream.peer_addr()?,"New connection");
-    let (reader, writer) = stream.into_split();
-
+async fn handle_connection_remote_connection<S: AsyncRead + Unpin>(
+    mut stream: S,
+    tx: UnboundedSender<Message>,
+) -> Result<(), ServerError> {
     let mut read_buf = vec![];
     let mut tmp = [0u8; 4096];
-    let mut reader = tokio::io::BufReader::new(reader);
-    let mut writer = tokio::io::BufWriter::new(writer);
     loop {
-        match reader.read(&mut tmp).await {
+        match stream.read(&mut tmp).await {
             Ok(0) => {
                 debug!("Connection closed");
                 break;
