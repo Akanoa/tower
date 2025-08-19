@@ -1,4 +1,4 @@
-use crate::cli::Cli;
+use crate::cli::{Action, Cli, Local};
 use crate::error::ServerError;
 use clap::Parser;
 use tokio::io::AsyncReadExt;
@@ -9,6 +9,7 @@ use tracing::{debug, error, info, warn};
 mod cli;
 mod error;
 mod interface;
+mod tcp_server;
 
 use tokio::sync::mpsc;
 
@@ -16,6 +17,16 @@ pub async fn run() -> Result<(), error::ServerError> {
     let _ = tracing_subscriber::fmt::init();
     let args = Cli::parse();
 
+    match args.command {
+        Action::Local(local) => handle_local(local).await?,
+        Action::Aggregator(_) => {}
+        Action::Proxy(_) => {}
+    }
+
+    Ok(())
+}
+
+async fn handle_local(args: Local) -> Result<(), error::ServerError> {
     if std::fs::exists(&args.socket)? {
         if args.force {
             debug!("Removing previous socket file");
@@ -59,7 +70,6 @@ pub async fn run() -> Result<(), error::ServerError> {
             }
         }
     }
-
     Ok(())
 }
 
