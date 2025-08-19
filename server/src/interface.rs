@@ -549,6 +549,7 @@ impl AppState {
 pub async fn run_tui(
     mut rx: MessageReceiver,
     aggregator: Option<AggregatorTabConfig>,
+    mut logs_rx: Option<mpsc::UnboundedReceiver<String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use ratatui::crossterm::event::{self, Event, KeyCode};
     use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -573,16 +574,23 @@ pub async fn run_tui(
 
     // Aggregator tab state
     let aggregator_mode = aggregator.is_some();
+    let logs_available = logs_rx.is_some();
     let (mut backends, mut control_tx_opt) = if let Some(cfg) = aggregator.clone() {
         (cfg.backends, Some(cfg.control_tx))
     } else {
         (Vec::new(), None)
     };
     let mut in_backends_tab = false; // only meaningful if aggregator_mode
+    let mut in_logs_tab = false; // available in all modes if logs_rx is Some
     let mut polling_paused = false;
     let mut backends_sel: usize = 0;
     let mut adding_backend = false;
     let mut add_buffer = String::new();
+
+    // Logs state
+    let mut logs: VecDeque<String> = VecDeque::new();
+    let mut logs_offset: usize = 0; // 0 = follow last lines
+    const MAX_LOG_LINES: usize = 2000;
 
     // UI loop
     loop {
@@ -600,6 +608,18 @@ pub async fn run_tui(
             last_prune = Instant::now();
         }
 
+        // Drain logs if provided
+        if let Some(ref mut lrx) = logs_rx {
+            while let Ok(line) = lrx.try_recv() {
+                if logs.len() >= MAX_LOG_LINES {
+                    let _ = logs.pop_front();
+                }
+                logs.push_back(line);
+                // keep following unless user scrolled up
+                if logs_offset == 0 {}
+            }
+        }
+
         let selected_watch = app.selected_watch_ids();
         let selected_tenant = app.selected_tenant_name();
         terminal.draw(|f| {
@@ -609,7 +629,29 @@ pub async fn run_tui(
                 .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
                 .split(size);
 
-            if aggregator_mode && in_backends_tab {
+            if in_logs_tab {
+                // Logs tab
+                let title = "Logs [Tab switch | Up/Down scroll | c clear | q quit]".to_string();
+                let header = Block::default().title(title).borders(Borders::ALL);
+                f.render_widget(header, chunks[0]);
+                // Determine visible window
+                let area = chunks[1];
+                let inner_height = area.height.saturating_sub(2) as usize; // rough estimate
+                let total = logs.len();
+                let start = if logs_offset == 0 {
+                    total.saturating_sub(inner_height)
+                } else {
+                    total.saturating_sub(inner_height + logs_offset)
+                };
+                let mut display: String = String::new();
+                for line in logs.iter().skip(start).take(inner_height) {
+                    display.push_str(line);
+                    display.push('\n');
+                }
+                let paragraph = Paragraph::new(display).block(Block::default().title("Recent logs").borders(Borders::ALL));
+                f.render_widget(paragraph, chunks[1]);
+                return;
+            } else if aggregator_mode && in_backends_tab {
                 // Backends management tab
                 let title = if adding_backend {
                     format!(
@@ -654,9 +696,16 @@ pub async fn run_tui(
                 return;
             } else {
                 // Main tab (existing UI)
+                let tab_hint = if aggregator_mode {
+                    if logs_available { "[Tab: Backends/Logs] " } else { "[Tab: Backends] " }
+                } else if logs_available {
+                    "[Tab: Logs] "
+                } else {
+                    ""
+                };
                 let header_title = format!(
                     "{}Watchers by Tenant/Executor (q quit, / tenant filter, h host filter, Esc/Enter exit filter, arrows navigate, Enter/Right fold/unfold) | Tenant{}: {} | Host{}: {}",
-                    if aggregator_mode { "[Tab: Backends] " } else { "" },
+                    tab_hint,
                     if filtering { " [typing]" } else { "" },
                     if app.filter.is_empty() { "<none>".to_string() } else { app.filter.clone() },
                     if filtering_host { " [typing]" } else { "" },
@@ -1045,10 +1094,31 @@ pub async fn run_tui(
                         }
                     } else {
                         // Not in text filtering modes
-                        if aggregator_mode && in_backends_tab {
+                        if in_logs_tab {
+                            match key.code {
+                                KeyCode::Tab => {
+                                    // Cycle: Logs -> Main if no aggregator, otherwise Logs -> Main
+                                    in_logs_tab = false;
+                                },
+                                KeyCode::Char('q') => break,
+                                KeyCode::Char('c') => { logs.clear(); logs_offset = 0; },
+                                KeyCode::Up => {
+                                    // scroll up
+                                    if logs.len() > 0 {
+                                        // increase offset up to max
+                                        let max_off = logs.len().saturating_sub(1);
+                                        if logs_offset < max_off { logs_offset += 1; }
+                                    }
+                                },
+                                KeyCode::Down => {
+                                    if logs_offset > 0 { logs_offset -= 1; }
+                                },
+                                _ => {}
+                            }
+                        } else if aggregator_mode && in_backends_tab {
                             // Backends tab key handling
                             match key.code {
-                                KeyCode::Tab => { in_backends_tab = false; },
+                                KeyCode::Tab => { if logs_available { in_backends_tab = false; in_logs_tab = true; } else { in_backends_tab = false; } },
                                 KeyCode::Char('p') => {
                                     polling_paused = !polling_paused;
                                     if let Some(ref txc) = control_tx_opt {
@@ -1106,6 +1176,7 @@ pub async fn run_tui(
                             match key.code {
                                 KeyCode::Tab => {
                                     if aggregator_mode { in_backends_tab = true; }
+                                    else if logs_available { in_logs_tab = true; }
                                 },
                                 KeyCode::Char('q') => break,
                                 KeyCode::Char('/') => { filtering = true; filtering_host = false; app.selected = 0; }

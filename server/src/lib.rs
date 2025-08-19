@@ -16,19 +16,64 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
 
 pub async fn run() -> Result<(), ServerError> {
-    let _ = tracing_subscriber::fmt::init();
+    // Setup tracing to send logs into a channel consumed by the TUI
+    let (log_tx, log_rx) = mpsc::unbounded_channel::<String>();
+
+    // Custom writer that forwards logs to the channel (line-buffered)
+    struct LogWriter {
+        tx: mpsc::UnboundedSender<String>,
+        buf: Vec<u8>,
+    }
+    impl Clone for LogWriter {
+        fn clone(&self) -> Self {
+            LogWriter { tx: self.tx.clone(), buf: Vec::new() }
+        }
+    }
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.buf.extend_from_slice(data);
+            let mut last_idx = 0usize;
+            for i in 0..self.buf.len() {
+                if self.buf[i] == b'\n' {
+                    let line = String::from_utf8_lossy(&self.buf[last_idx..i]).to_string();
+                    let _ = self.tx.send(line);
+                    last_idx = i + 1;
+                }
+            }
+            if last_idx > 0 {
+                self.buf.drain(0..last_idx);
+            }
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if !self.buf.is_empty() {
+                let line = String::from_utf8_lossy(&self.buf).to_string();
+                let _ = self.tx.send(line);
+                self.buf.clear();
+            }
+            Ok(())
+        }
+    }
+
+    // Initialize tracing subscriber with our writer
+    let make_writer = move || LogWriter { tx: log_tx.clone(), buf: Vec::new() };
+    let _ = tracing_subscriber::fmt()
+        .with_writer(make_writer)
+        .with_ansi(false)
+        .try_init();
+
     let args = Cli::parse();
 
     match args.command {
-        Action::Local(local) => handle_local(local).await?,
-        Action::Aggregator(aggregator) => handle_aggregator(aggregator).await?,
+        Action::Local(local) => handle_local(local, log_rx).await?,
+        Action::Aggregator(aggregator) => handle_aggregator(aggregator, log_rx).await?,
         Action::Proxy(proxy) => handle_proxy(proxy).await?,
     }
 
     Ok(())
 }
 
-async fn handle_local(args: Local) -> Result<(), ServerError> {
+async fn handle_local(args: Local, mut log_rx: mpsc::UnboundedReceiver<String>) -> Result<(), ServerError> {
     // channel to forward all messages to TUI
     let (tx, rx) = mpsc::unbounded_channel::<Message>();
     // spawn server socket in background
@@ -40,7 +85,7 @@ async fn handle_local(args: Local) -> Result<(), ServerError> {
     });
 
     // run TUI in foreground; pressing 'q' will return
-    if let Err(err) = interface::run_tui(rx, None).await {
+    if let Err(err) = interface::run_tui(rx, None, Some(log_rx)).await {
         error!(?err, "TUI exited with error");
     }
 
@@ -63,7 +108,7 @@ async fn handle_proxy(args: Proxy) -> Result<(), ServerError> {
     Ok(())
 }
 
-async fn handle_aggregator(args: Aggregator) -> Result<(), ServerError> {
+async fn handle_aggregator(args: Aggregator, mut log_rx: mpsc::UnboundedReceiver<String>) -> Result<(), ServerError> {
     // channel to forward all messages to TUI
     let (tx, rx) = mpsc::unbounded_channel::<Message>();
     // control channel for backend polling management
@@ -80,7 +125,7 @@ async fn handle_aggregator(args: Aggregator) -> Result<(), ServerError> {
     let tui_cfg = interface::AggregatorTabConfig { backends: args.backends.clone(), control_tx: ctrl_tx };
 
     // Run TUI in foreground
-    if let Err(err) = interface::run_tui(rx, Some(tui_cfg)).await {
+    if let Err(err) = interface::run_tui(rx, Some(tui_cfg), Some(log_rx)).await {
         error!(?err, "TUI exited with error");
     }
 
