@@ -33,7 +33,7 @@ async fn handle_local(args: Local) -> Result<(), ServerError> {
     let (tx, rx) = mpsc::unbounded_channel::<Message>();
     // spawn TUI
     tokio::spawn(async move {
-        if let Err(err) = interface::run_tui(rx).await {
+        if let Err(err) = interface::run_tui(rx, None).await {
             error!(?err, "TUI exited with error");
         }
     });
@@ -61,15 +61,23 @@ async fn handle_proxy(args: Proxy) -> Result<(), ServerError> {
 async fn handle_aggregator(args: Aggregator) -> Result<(), ServerError> {
     // channel to forward all messages to TUI
     let (tx, rx) = mpsc::unbounded_channel::<Message>();
+    // control channel for backend polling management
+    let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<tcp_server::PollControl>();
+
+    // Prepare aggregator tab config for TUI
+    let backends_copy = args.backends.clone();
+    let tui_ctrl_tx = ctrl_tx.clone();
+
     // spawn TUI
     tokio::spawn(async move {
-        if let Err(err) = interface::run_tui(rx).await {
+        let cfg = interface::AggregatorTabConfig { backends: backends_copy, control_tx: tui_ctrl_tx };
+        if let Err(err) = interface::run_tui(rx, Some(cfg)).await {
             error!(?err, "TUI exited with error");
         }
     });
 
     // Start restartable polling jobs for each backend address
-    tcp_server::poll_backends(args.backends, tx).await?;
+    tcp_server::poll_backends(args.backends, tx, ctrl_rx).await?;
     Ok(())
 }
 

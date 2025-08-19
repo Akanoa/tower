@@ -75,10 +75,34 @@ async fn handle_connection(mut stream: TcpStream, buffer: CircularBuffer) {
 pub async fn poll_backends(
     backends: Vec<(String, u16)>,
     tx: UnboundedSender<Message>,
+    mut control_rx: UnboundedReceiver<PollControl>,
 ) -> Result<(), ServerError> {
     let mut handles = vec![];
+    // Shared pause flag controlled by TUI
+    let paused = std::sync::Arc::new(tokio::sync::RwLock::new(false));
+
+    // Control task to update pause flag
+    {
+        let paused = paused.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = control_rx.recv().await {
+                match cmd {
+                    PollControl::Pause => {
+                        *paused.write().await = true;
+                        info!("Polling paused by user");
+                    }
+                    PollControl::Resume => {
+                        *paused.write().await = false;
+                        info!("Polling resumed by user");
+                    }
+                }
+            }
+        });
+    }
+
     for (addr, port) in backends.into_iter() {
         let tx_clone = tx.clone();
+        let paused_flag = paused.clone();
         // Spawn a task per backend address that reconnects on failure
         let handle = tokio::spawn(async move {
             let mut backoff_secs: u64 = 1;
@@ -90,7 +114,7 @@ pub async fn poll_backends(
                         // Reset backoff after a successful connection
                         backoff_secs = 1;
                         // Poll until disconnection or error
-                        if let Err(err) = poll_backend(&mut stream, tx_clone.clone()).await {
+                        if let Err(err) = poll_backend(&mut stream, tx_clone.clone(), paused_flag.clone()).await {
                             warn!(?err, backend = %format!("{}:{}", addr, port), "Polling error, will reconnect");
                         } else {
                             warn!(backend = %format!("{}:{}", addr, port), "Backend disconnected, will reconnect");
@@ -117,6 +141,7 @@ pub async fn poll_backends(
 async fn poll_backend(
     backend: &mut TcpStream,
     tx: UnboundedSender<Message>,
+    paused: std::sync::Arc<tokio::sync::RwLock<bool>>,
 ) -> Result<(), ServerError> {
     let mut read_buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 4096];
@@ -124,6 +149,11 @@ async fn poll_backend(
     info!("Polling backend");
 
     loop {
+        // If paused, wait and continue without reading
+        if *paused.read().await {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
         match backend.read(&mut tmp).await {
             Ok(0) => {
                 debug!("Backend connection closed");
@@ -179,6 +209,12 @@ async fn poll_backend(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub enum PollControl {
+    Pause,
+    Resume,
 }
 
 #[cfg(test)]
