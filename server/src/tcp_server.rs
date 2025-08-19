@@ -77,64 +77,92 @@ pub async fn poll_backends(
     tx: UnboundedSender<Message>,
     mut control_rx: UnboundedReceiver<PollControl>,
 ) -> Result<(), ServerError> {
-    let mut handles = vec![];
-    // Shared pause flag controlled by TUI
+    use std::collections::HashMap;
     let paused = std::sync::Arc::new(tokio::sync::RwLock::new(false));
 
-    // Control task to update pause flag
-    {
-        let paused = paused.clone();
-        tokio::spawn(async move {
-            while let Some(cmd) = control_rx.recv().await {
-                match cmd {
-                    PollControl::Pause => {
-                        *paused.write().await = true;
-                        info!("Polling paused by user");
-                    }
-                    PollControl::Resume => {
-                        *paused.write().await = false;
-                        info!("Polling resumed by user");
-                    }
-                }
-            }
-        });
-    }
+    // Map of backend -> (handle, shutdown_flag)
+    let mut tasks: HashMap<(String, u16), (tokio::task::JoinHandle<()>, std::sync::Arc<tokio::sync::RwLock<bool>>)> = HashMap::new();
 
-    for (addr, port) in backends.into_iter() {
+    // helper to spawn a backend task
+    let mut make_backend_task = |addr: String, port: u16| {
         let tx_clone = tx.clone();
         let paused_flag = paused.clone();
-        // Spawn a task per backend address that reconnects on failure
+        let shutdown = std::sync::Arc::new(tokio::sync::RwLock::new(false));
+        let shutdown_clone = shutdown.clone();
+        let addr_clone = addr.clone();
         let handle = tokio::spawn(async move {
             let mut backoff_secs: u64 = 1;
             let max_backoff: u64 = 30;
             loop {
-                match tokio::net::TcpStream::connect(format!("{}:{}", addr, port)).await {
+                if *shutdown_clone.read().await { break; }
+                match tokio::net::TcpStream::connect(format!("{}:{}", addr_clone, port)).await {
                     Ok(mut stream) => {
-                        info!(backend = %format!("{}:{}", addr, port), "Connected to backend");
-                        // Reset backoff after a successful connection
+                        info!(backend = %format!("{}:{}", addr_clone, port), "Connected to backend");
                         backoff_secs = 1;
-                        // Poll until disconnection or error
                         if let Err(err) = poll_backend(&mut stream, tx_clone.clone(), paused_flag.clone()).await {
-                            warn!(?err, backend = %format!("{}:{}", addr, port), "Polling error, will reconnect");
+                            warn!(?err, backend = %format!("{}:{}", addr_clone, port), "Polling error, will reconnect");
                         } else {
-                            warn!(backend = %format!("{}:{}", addr, port), "Backend disconnected, will reconnect");
+                            warn!(backend = %format!("{}:{}", addr_clone, port), "Backend disconnected, will reconnect");
                         }
                     }
                     Err(err) => {
-                        warn!(?err, backend = %format!("{}:{}", addr, port), "Failed to connect to backend");
-                        // fall through to backoff sleep
+                        warn!(?err, backend = %format!("{}:{}", addr_clone, port), "Failed to connect to backend");
                     }
                 }
-                // Backoff before retrying
+                if *shutdown_clone.read().await { break; }
                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
                 backoff_secs = std::cmp::min(backoff_secs.saturating_mul(2), max_backoff);
             }
+            info!(backend = %format!("{}:{}", addr_clone, port), "Backend task stopped");
         });
-        handles.push(handle);
+        ((addr, port), (handle, shutdown))
+    };
+
+    // spawn initial backends
+    for (addr, port) in backends.into_iter() {
+        let (k, v) = make_backend_task(addr, port);
+        tasks.insert(k, v);
     }
-    for handle in handles {
+
+    // control loop
+    while let Some(cmd) = control_rx.recv().await {
+        match cmd {
+            PollControl::Pause => {
+                *paused.write().await = true;
+                info!("Polling paused by user");
+            }
+            PollControl::Resume => {
+                *paused.write().await = false;
+                info!("Polling resumed by user");
+            }
+            PollControl::AddBackend(addr, port) => {
+                if !tasks.contains_key(&(addr.clone(), port)) {
+                    info!(backend = %format!("{}:{}", addr, port), "Adding backend");
+                    let (k, v) = make_backend_task(addr, port);
+                    tasks.insert(k, v);
+                } else {
+                    debug!("Backend already exists");
+                }
+            }
+            PollControl::RemoveBackend(addr, port) => {
+                if let Some((handle, shutdown)) = tasks.remove(&(addr.clone(), port)) {
+                    info!(backend = %format!("{}:{}", addr, port), "Removing backend");
+                    *shutdown.write().await = true;
+                    // Give the task a chance to stop gracefully
+                    let _ = handle.await;
+                } else {
+                    debug!("Backend not found to remove");
+                }
+            }
+        }
+    }
+
+    // channel closed, stop all tasks gracefully
+    for ((_addr, _port), (handle, shutdown)) in tasks.into_iter() {
+        *shutdown.write().await = true;
         let _ = handle.await;
     }
+
     Ok(())
 }
 
@@ -215,6 +243,8 @@ async fn poll_backend(
 pub enum PollControl {
     Pause,
     Resume,
+    AddBackend(String, u16),
+    RemoveBackend(String, u16),
 }
 
 #[cfg(test)]

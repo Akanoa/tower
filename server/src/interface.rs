@@ -573,13 +573,16 @@ pub async fn run_tui(
 
     // Aggregator tab state
     let aggregator_mode = aggregator.is_some();
-    let (backends, mut control_tx_opt) = if let Some(cfg) = aggregator.clone() {
+    let (mut backends, mut control_tx_opt) = if let Some(cfg) = aggregator.clone() {
         (cfg.backends, Some(cfg.control_tx))
     } else {
         (Vec::new(), None)
     };
     let mut in_backends_tab = false; // only meaningful if aggregator_mode
     let mut polling_paused = false;
+    let mut backends_sel: usize = 0;
+    let mut adding_backend = false;
+    let mut add_buffer = String::new();
 
     // UI loop
     loop {
@@ -608,10 +611,18 @@ pub async fn run_tui(
 
             if aggregator_mode && in_backends_tab {
                 // Backends management tab
-                let title = format!(
-                    "Backends Management [Tab to switch, p to {}]",
-                    if polling_paused { "resume" } else { "pause" }
-                );
+                let title = if adding_backend {
+                    format!(
+                        "Backends Management [Tab switch | p {} | ENTER submit | ESC cancel] Add backend: {}",
+                        if polling_paused { "resume" } else { "pause" },
+                        add_buffer
+                    )
+                } else {
+                    format!(
+                        "Backends Management [Tab switch | p {} | a add | d delete]",
+                        if polling_paused { "resume" } else { "pause" }
+                    )
+                };
                 let header = Block::default().title(title).borders(Borders::ALL);
                 f.render_widget(header, chunks[0]);
                 // List backends and current state
@@ -621,12 +632,18 @@ pub async fn run_tui(
                     Line::from("Port"),
                     Line::from("State"),
                 ]).style(Style::default().add_modifier(Modifier::BOLD)));
-                for (addr, port) in &backends {
-                    rows.push(Row::new(vec![
+                if backends_sel >= backends.len() && !backends.is_empty() {
+                    backends_sel = backends.len() - 1;
+                }
+                let sel_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+                for (i, (addr, port)) in backends.iter().enumerate() {
+                    let mut row = Row::new(vec![
                         Line::from(addr.clone()),
                         Line::from(port.to_string()),
                         Line::from(if polling_paused { "paused" } else { "running" }.to_string()),
-                    ]));
+                    ]);
+                    if i == backends_sel { row = row.style(sel_style); }
+                    rows.push(row);
                 }
                 let table = Table::new(
                     rows,
@@ -1027,46 +1044,80 @@ pub async fn run_tui(
                             _ => {}
                         }
                     } else {
-                        match key.code {
-                            KeyCode::Tab => {
-                                if aggregator_mode {
-                                    in_backends_tab = !in_backends_tab;
-                                }
-                            },
-                            KeyCode::Char('p') => {
-                                if aggregator_mode && in_backends_tab {
+                        // Not in text filtering modes
+                        if aggregator_mode && in_backends_tab {
+                            // Backends tab key handling
+                            match key.code {
+                                KeyCode::Tab => { in_backends_tab = false; },
+                                KeyCode::Char('p') => {
                                     polling_paused = !polling_paused;
                                     if let Some(ref txc) = control_tx_opt {
                                         let _ = if polling_paused { txc.send(PollControl::Pause) } else { txc.send(PollControl::Resume) };
                                     }
+                                },
+                                KeyCode::Char('q') => break,
+                                code => {
+                                    if adding_backend {
+                                        match code {
+                                            KeyCode::Esc => { adding_backend = false; add_buffer.clear(); },
+                                            KeyCode::Enter => {
+                                                if let Some((addr, port_str)) = add_buffer.split_once(':') {
+                                                    if let Ok(port) = port_str.parse::<u16>() {
+                                                        let addr_s = addr.to_string();
+                                                        if !backends.iter().any(|(a,p)| a==&addr_s && *p==port) {
+                                                            backends.push((addr_s.clone(), port));
+                                                            if let Some(ref txc) = control_tx_opt {
+                                                                let _ = txc.send(PollControl::AddBackend(addr_s.clone(), port));
+                                                            }
+                                                            backends_sel = backends.len().saturating_sub(1);
+                                                        }
+                                                    }
+                                                }
+                                                adding_backend = false; add_buffer.clear();
+                                            },
+                                            KeyCode::Backspace => { add_buffer.pop(); },
+                                            KeyCode::Char(c) => { if !c.is_control() { add_buffer.push(c); } },
+                                            _ => {}
+                                        }
+                                    } else {
+                                        match code {
+                                            KeyCode::Char('a') => { adding_backend = true; add_buffer.clear(); },
+                                            KeyCode::Char('d') => {
+                                                if !backends.is_empty() && backends_sel < backends.len() {
+                                                    let (addr, port) = backends[backends_sel].clone();
+                                                    if let Some(ref txc) = control_tx_opt { let _ = txc.send(PollControl::RemoveBackend(addr.clone(), port)); }
+                                                    backends.remove(backends_sel);
+                                                    if backends_sel >= backends.len() && backends_sel>0 { backends_sel -= 1; }
+                                                }
+                                            },
+                                            KeyCode::Down => {
+                                                if backends_sel + 1 < backends.len() { backends_sel += 1; }
+                                            },
+                                            KeyCode::Up => {
+                                                if backends_sel > 0 { backends_sel -= 1; }
+                                            },
+                                            _ => {}
+                                        }
+                                    }
                                 }
-                            },
-                            KeyCode::Char('q') => break,
-                            KeyCode::Char('/') => {
-                                filtering = true;
-                                filtering_host = false;
-                                app.selected = 0;
                             }
-                            KeyCode::Char('h') => {
-                                filtering_host = true;
-                                filtering = false;
-                                app.selected = 0;
-                            }
-                            KeyCode::Down => {
-                                let max = app.visible_rows().len();
-                                if app.selected + 1 < max {
-                                    app.selected += 1;
+                        } else {
+                            // Main tab key handling
+                            match key.code {
+                                KeyCode::Tab => {
+                                    if aggregator_mode { in_backends_tab = true; }
+                                },
+                                KeyCode::Char('q') => break,
+                                KeyCode::Char('/') => { filtering = true; filtering_host = false; app.selected = 0; }
+                                KeyCode::Char('h') => { filtering_host = true; filtering = false; app.selected = 0; }
+                                KeyCode::Down => {
+                                    let max = app.visible_rows().len();
+                                    if app.selected + 1 < max { app.selected += 1; }
                                 }
+                                KeyCode::Up => { if app.selected > 0 { app.selected -= 1; } }
+                                KeyCode::Right | KeyCode::Enter | KeyCode::Left => { app.toggle_fold_at(app.selected); }
+                                _ => {}
                             }
-                            KeyCode::Up => {
-                                if app.selected > 0 {
-                                    app.selected -= 1;
-                                }
-                            }
-                            KeyCode::Right | KeyCode::Enter | KeyCode::Left => {
-                                app.toggle_fold_at(app.selected);
-                            }
-                            _ => {}
                         }
                     }
                 }
