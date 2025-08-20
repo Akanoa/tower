@@ -1,4 +1,4 @@
-use crate::interface::filters::{FilterType, Rowable};
+use crate::interface::filters::FilterType;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -56,6 +56,22 @@ pub type MessageReceiver = mpsc::UnboundedReceiver<Message>;
 pub struct AggregatorTabConfig {
     pub backends: Vec<(String, u16)>,
     pub control_tx: mpsc::UnboundedSender<PollControl>,
+}
+
+// A compact descriptor of a visible row with identifiers.
+#[derive(Debug, Clone)]
+enum RowKind {
+    Tenant,
+    Executor,
+    Watcher,
+}
+
+#[derive(Debug, Clone)]
+struct RowPos {
+    kind: RowKind,
+    tenant_name: String,
+    exec_id: Option<(i64, String)>,
+    watch_id: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -307,7 +323,7 @@ impl AppState {
                 continue;
             }
 
-            for (exec_id, exec) in visible_execs {
+            for (_exec_id, exec) in visible_execs {
                 // add the row displaying the executor in the table
                 rows.push(exec.as_row());
 
@@ -324,100 +340,64 @@ impl AppState {
         rows
     }
 
-    // Toggle fold state for the item at the visible index, if it's a tenant or executor row
-    pub fn toggle_fold_at(&mut self, index: usize) {
+    // Internal helper: map a visible row index to its logical position.
+    fn visible_row_at(&self, index: usize) -> Option<RowPos> {
         let mut i = 0usize;
-        for (_tenant_name, tenant) in self.tenants.iter_mut() {
-            // If the row is hidden, then don't take it in an account in folding compute
+        for (tenant_name, tenant) in &self.tenants {
+            // Respect tenant filter
             if !self.filters.is_row_visible(tenant, FilterType::Tenant) {
                 continue;
             }
-
-            // determine if tenant has any execs visible under host filter
+            // Determine if any executor is visible under the host filter
             let mut any_exec_visible = false;
             for (_eid, executor) in tenant.executors.iter() {
-                // at least on executor matches the host filter
                 if self.filters.is_row_visible(executor, FilterType::Host) {
                     any_exec_visible = true;
                     break;
                 }
             }
-            // If no executors match the host filter, the all tenant can skip
             if !any_exec_visible {
                 continue;
             }
-
+            // Tenant row
             if i == index {
-                tenant.folded = !tenant.folded;
-                return;
+                return Some(RowPos {
+                    kind: RowKind::Tenant,
+                    tenant_name: tenant_name.clone(),
+                    exec_id: None,
+                    watch_id: None,
+                });
             }
             i += 1;
             if tenant.folded {
                 continue;
             }
-            for (_exec_id, exec) in tenant.executors.iter_mut() {
-                // the executor is filtered by host
+            // Executor rows
+            for (exec_id, exec) in &tenant.executors {
                 if !self.filters.is_row_visible(exec, FilterType::Host) {
                     continue;
                 }
                 if i == index {
-                    exec.folded = !exec.folded;
-                    return;
+                    return Some(RowPos {
+                        kind: RowKind::Executor,
+                        tenant_name: tenant_name.clone(),
+                        exec_id: Some(exec_id.clone()),
+                        watch_id: None,
+                    });
                 }
                 i += 1;
                 if exec.folded {
                     continue;
                 }
-                // skip watcher rows
-                i += exec.watchers.len();
-            }
-        }
-    }
-
-    // Resolve current selection to a watcher identifier if selection points to a watcher row
-    pub fn selected_watch_ids(&self) -> Option<(String, (i64, String), i64)> {
-        let mut i = 0usize;
-        for (tenant_name, tenant) in &self.tenants {
-            // If the row is hidden, then don't take it in an account in folding compute
-            if !self.filters.is_row_visible(tenant, FilterType::Tenant) {
-                continue;
-            }
-
-            // Only consider tenants with at least one visible executor under host filter
-            let mut any_exec_visible = false;
-            for (_eid, executor) in tenant.executors.iter() {
-                // at least on executor matches the host filter
-                if self.filters.is_row_visible(executor, FilterType::Host) {
-                    any_exec_visible = true;
-                    break;
-                }
-            }
-            if !any_exec_visible {
-                continue;
-            }
-            if i == self.selected {
-                // tenant row selected
-                return None;
-            }
-            i += 1;
-            if tenant.folded {
-                continue;
-            }
-            for (exec_id, exec) in &tenant.executors {
-                // the executor is filtered by host
-                if !self.filters.is_row_visible(exec, FilterType::Host) {
-                    continue;
-                }
-                if i == self.selected {
-                    return None;
-                }
-                i += 1;
-                if exec.folded {
-                    continue;
-                }
+                // Watcher rows
                 for (watch_id, _watch) in &exec.watchers {
-                    if i == self.selected {
-                        return Some((tenant_name.clone(), exec_id.clone(), *watch_id));
+                    if i == index {
+                        return Some(RowPos {
+                            kind: RowKind::Watcher,
+                            tenant_name: tenant_name.clone(),
+                            exec_id: Some(exec_id.clone()),
+                            watch_id: Some(*watch_id),
+                        });
                     }
                     i += 1;
                 }
@@ -426,52 +406,50 @@ impl AppState {
         None
     }
 
-    // If selection is on a tenant row, return its name; otherwise None
-    pub fn selected_tenant_name(&self) -> Option<String> {
-        let mut i = 0usize;
-        for (tenant_name, tenant) in &self.tenants {
-            // If the row is hidden, then don't take it in an account in folding compute
-            if !self.filters.is_row_visible(tenant, FilterType::Tenant) {
-                continue;
-            }
-            // Consider only tenants with at least one visible executor under host filter
-            let mut any_exec_visible = false;
-            for (_eid, executor) in tenant.executors.iter() {
-                // the executor is filtered by host
-                if self.filters.is_row_visible(executor, FilterType::Host) {
-                    any_exec_visible = true;
-                    break;
+    // Toggle fold state for the item at the visible index, if it's a tenant or executor row
+    pub fn toggle_fold_at(&mut self, index: usize) {
+        if let Some(pos) = self.visible_row_at(index) {
+            match (pos.kind, pos.exec_id) {
+                (RowKind::Tenant, _) => {
+                    if let Some(tenant) = self.tenants.get_mut(&pos.tenant_name) {
+                        tenant.folded = !tenant.folded;
+                    }
                 }
-            }
-            if !any_exec_visible {
-                continue;
-            }
-            if i == self.selected {
-                // tenant row selected
-                return Some(tenant_name.clone());
-            }
-            i += 1;
-            if tenant.folded {
-                continue;
-            }
-            for (_exec_id, exec) in &tenant.executors {
-                // the executor is filtered by host
-                if !self.filters.is_row_visible(exec, FilterType::Host) {
-                    continue;
+                (RowKind::Executor, Some(exec_id)) => {
+                    if let Some(tenant) = self.tenants.get_mut(&pos.tenant_name) {
+                        if let Some(exec) = tenant.executors.get_mut(&exec_id) {
+                            exec.folded = !exec.folded;
+                        }
+                    }
                 }
-                if i == self.selected {
-                    // executor row selected
-                    return None;
-                }
-                i += 1;
-                if exec.folded {
-                    continue;
-                }
-                // skip watcher rows
-                i += exec.watchers.len();
+                _ => { /* do nothing for watcher rows */ }
             }
         }
-        None
+    }
+
+    // Resolve the current selection to a watcher identifier if selection points to a watcher row
+    pub fn selected_watch_ids(&self) -> Option<(String, (i64, String), i64)> {
+        match self.visible_row_at(self.selected) {
+            Some(RowPos {
+                kind: RowKind::Watcher,
+                tenant_name,
+                exec_id: Some(exec_id),
+                watch_id: Some(watch_id),
+            }) => Some((tenant_name, exec_id, watch_id)),
+            _ => None,
+        }
+    }
+
+    // If selection is on a tenant row, return its name; otherwise None
+    pub fn selected_tenant_name(&self) -> Option<String> {
+        match self.visible_row_at(self.selected) {
+            Some(RowPos {
+                kind: RowKind::Tenant,
+                tenant_name,
+                ..
+            }) => Some(tenant_name),
+            _ => None,
+        }
     }
 }
 
@@ -480,7 +458,7 @@ pub async fn run_tui(
     aggregator: Option<AggregatorTabConfig>,
     mut logs_rx: Option<mpsc::UnboundedReceiver<String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use ratatui::crossterm::event::{self, Event, KeyCode};
+    use ratatui::crossterm::event::{self, Event};
     use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     use ratatui::crossterm::{execute, terminal};
     use std::io::{stdout, Stdout};
