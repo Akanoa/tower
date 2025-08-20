@@ -2,19 +2,19 @@ use crate::interface::filters::{FilterType, Rowable};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::tcp_server::PollControl;
+use executor_item::ExecutorItem;
+use protocol::{Message, MessageBody, MessageRegister, MessageReport, MessageUnregister};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
 use ratatui::Terminal;
+use tenant_item::TenantItem;
 use tokio::sync::mpsc;
 
-use crate::interface::tenant_item::TenantStatistics;
-use crate::tcp_server::PollControl;
-use protocol::{Message, MessageBody, MessageRegister, MessageReport, MessageUnregister};
-use tenant_item::TenantItem;
-
+mod executor_item;
 mod filters;
 mod tenant_item;
 
@@ -66,20 +66,6 @@ pub struct WatchItem {
     pub lag_hist: VecDeque<u64>,
     pub exec_hist: VecDeque<f64>,
     pub time_hist: VecDeque<f64>,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct ExecutorItem {
-    pub executor_id: i64,
-    pub folded: bool,
-    pub watchers: BTreeMap<i64, WatchItem>,
-    pub host: String,
-}
-
-impl Rowable for ExecutorItem {
-    fn get_filterable_data(&self) -> &str {
-        self.host.as_str()
-    }
 }
 
 #[derive(Debug, Default)]
@@ -320,41 +306,11 @@ impl AppState {
                 // Skip tenant entirely if no executor matches the host filter
                 continue;
             }
-            let t_prefix = if tenant.folded { "▸" } else { "▾" };
 
             let executors: Vec<&ExecutorItem> =
                 visible_execs.iter().map(|(_id, exec)| *exec).collect();
-            let stats = tenant.get_statistics(&executors);
 
-            let TenantStatistics {
-                mean_lag: tenant_mean_lag,
-                mean_execution_time: tenant_mean_exec,
-            } = stats;
-
-            rows.push(
-                Row::new(vec![
-                    Cell::from(Line::from(format!("{t_prefix} Tenant: {tenant_name}"))),
-                    {
-                        let style = if tenant_mean_lag > 10_000 {
-                            Style::default().fg(Color::Red)
-                        } else {
-                            Style::default()
-                        };
-                        Cell::from(Line::from(format!("{}", tenant_mean_lag))).style(style)
-                    },
-                    {
-                        let style = if tenant_mean_exec > 1000.0 {
-                            Style::default().fg(Color::Red)
-                        } else {
-                            Style::default()
-                        };
-                        Cell::from(Line::from(format!("{:.3} ms", tenant_mean_exec))).style(style)
-                    },
-                    Cell::from(Line::from("")),
-                    Cell::from(Line::from("")),
-                ])
-                .style(Style::default().add_modifier(Modifier::BOLD)),
-            );
+            rows.push(tenant.as_row(&executors));
             if tenant.folded {
                 continue;
             }
