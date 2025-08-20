@@ -58,20 +58,21 @@ pub struct AggregatorTabConfig {
     pub control_tx: mpsc::UnboundedSender<PollControl>,
 }
 
-// A compact descriptor of a visible row with identifiers.
+// A compact descriptor of a visible row with identifiers, carrying data per variant.
 #[derive(Debug, Clone)]
-enum RowKind {
-    Tenant,
-    Executor,
-    Watcher,
-}
-
-#[derive(Debug, Clone)]
-struct RowPos {
-    kind: RowKind,
-    tenant_name: String,
-    exec_id: Option<(i64, String)>,
-    watch_id: Option<i64>,
+enum RowPos {
+    Tenant {
+        tenant_name: String,
+    },
+    Executor {
+        tenant_name: String,
+        exec_id: (i64, String),
+    },
+    Watcher {
+        tenant_name: String,
+        exec_id: (i64, String),
+        watch_id: i64,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -296,7 +297,7 @@ impl AppState {
         // accumulate visible rows
         let mut rows = Vec::new();
 
-        for (tenant_name, tenant) in &self.tenants {
+        for (_tenant_name, tenant) in &self.tenants {
             // Filter out tenants
             if !self.filters.is_row_visible(tenant, FilterType::Tenant) {
                 continue;
@@ -361,11 +362,8 @@ impl AppState {
             }
             // Tenant row
             if i == index {
-                return Some(RowPos {
-                    kind: RowKind::Tenant,
+                return Some(RowPos::Tenant {
                     tenant_name: tenant_name.clone(),
-                    exec_id: None,
-                    watch_id: None,
                 });
             }
             i += 1;
@@ -378,11 +376,9 @@ impl AppState {
                     continue;
                 }
                 if i == index {
-                    return Some(RowPos {
-                        kind: RowKind::Executor,
+                    return Some(RowPos::Executor {
                         tenant_name: tenant_name.clone(),
-                        exec_id: Some(exec_id.clone()),
-                        watch_id: None,
+                        exec_id: exec_id.clone(),
                     });
                 }
                 i += 1;
@@ -392,11 +388,10 @@ impl AppState {
                 // Watcher rows
                 for (watch_id, _watch) in &exec.watchers {
                     if i == index {
-                        return Some(RowPos {
-                            kind: RowKind::Watcher,
+                        return Some(RowPos::Watcher {
                             tenant_name: tenant_name.clone(),
-                            exec_id: Some(exec_id.clone()),
-                            watch_id: Some(*watch_id),
+                            exec_id: exec_id.clone(),
+                            watch_id: *watch_id,
                         });
                     }
                     i += 1;
@@ -409,20 +404,23 @@ impl AppState {
     // Toggle fold state for the item at the visible index, if it's a tenant or executor row
     pub fn toggle_fold_at(&mut self, index: usize) {
         if let Some(pos) = self.visible_row_at(index) {
-            match (pos.kind, pos.exec_id) {
-                (RowKind::Tenant, _) => {
-                    if let Some(tenant) = self.tenants.get_mut(&pos.tenant_name) {
+            match pos {
+                RowPos::Tenant { tenant_name } => {
+                    if let Some(tenant) = self.tenants.get_mut(&tenant_name) {
                         tenant.folded = !tenant.folded;
                     }
                 }
-                (RowKind::Executor, Some(exec_id)) => {
-                    if let Some(tenant) = self.tenants.get_mut(&pos.tenant_name) {
+                RowPos::Executor {
+                    tenant_name,
+                    exec_id,
+                } => {
+                    if let Some(tenant) = self.tenants.get_mut(&tenant_name) {
                         if let Some(exec) = tenant.executors.get_mut(&exec_id) {
                             exec.folded = !exec.folded;
                         }
                     }
                 }
-                _ => { /* do nothing for watcher rows */ }
+                RowPos::Watcher { .. } => { /* do nothing for watcher rows */ }
             }
         }
     }
@@ -430,11 +428,10 @@ impl AppState {
     // Resolve the current selection to a watcher identifier if selection points to a watcher row
     pub fn selected_watch_ids(&self) -> Option<(String, (i64, String), i64)> {
         match self.visible_row_at(self.selected) {
-            Some(RowPos {
-                kind: RowKind::Watcher,
+            Some(RowPos::Watcher {
                 tenant_name,
-                exec_id: Some(exec_id),
-                watch_id: Some(watch_id),
+                exec_id,
+                watch_id,
             }) => Some((tenant_name, exec_id, watch_id)),
             _ => None,
         }
@@ -443,11 +440,7 @@ impl AppState {
     // If selection is on a tenant row, return its name; otherwise None
     pub fn selected_tenant_name(&self) -> Option<String> {
         match self.visible_row_at(self.selected) {
-            Some(RowPos {
-                kind: RowKind::Tenant,
-                tenant_name,
-                ..
-            }) => Some(tenant_name),
+            Some(RowPos::Tenant { tenant_name }) => Some(tenant_name),
             _ => None,
         }
     }
