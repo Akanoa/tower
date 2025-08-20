@@ -1,16 +1,19 @@
+use crate::interface::filters::{FilterType, Rowable};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
-use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use protocol::{Message, MessageBody, MessageRegister, MessageReport, MessageUnregister};
 use crate::tcp_server::PollControl;
+use protocol::{Message, MessageBody, MessageRegister, MessageReport, MessageUnregister};
+
+mod filters;
 
 // Resample a u64 series to exactly `width` points for visual stretching in sparklines
 fn resample_to_width_u64(values: &[u64], width: usize) -> Vec<u64> {
@@ -68,6 +71,12 @@ pub struct ExecutorItem {
     pub host: String,
 }
 
+impl Rowable for ExecutorItem {
+    fn get_filterable_data(&self) -> &str {
+        self.host.as_str()
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct TenantItem {
     pub tenant: String,
@@ -75,10 +84,16 @@ pub struct TenantItem {
     pub executors: BTreeMap<(i64, String), ExecutorItem>,
 }
 
+impl Rowable for TenantItem {
+    fn get_filterable_data(&self) -> &str {
+        self.tenant.as_str()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct AppState {
     pub tenants: BTreeMap<String, TenantItem>,
-    // index of currently selected visible row in flat view
+    // index of the currently selected visible row in flat view
     pub selected: usize,
     // current tenant filter (case-insensitive contains)
     pub filter: String,
@@ -86,42 +101,106 @@ pub struct AppState {
     pub host_filter: String,
     // vertical scroll offset for the main table
     pub scroll_offset: usize,
+    // rows filters
+    pub filters: filters::Filters,
 }
 
 impl AppState {
-    pub fn apply_report(&mut self, host: String, report: MessageReport) {
-        let tenant_entry = self
-            .tenants
-            .entry(report.tenant.clone())
+    fn get_or_create_tenant(&mut self, tenant: &str) -> &mut TenantItem {
+        self.tenants
+            .entry(tenant.to_string())
             .or_insert_with(|| TenantItem {
-                tenant: report.tenant.clone(),
+                tenant: tenant.to_string(),
                 folded: false,
                 executors: BTreeMap::new(),
-            });
-        let exec_entry = tenant_entry
+            })
+    }
+
+    fn get_or_create_executor(
+        &mut self,
+        tenant: &str,
+        executor_id: i64,
+        host: &str,
+    ) -> &mut ExecutorItem {
+        let tenant_entry = self.get_or_create_tenant(tenant);
+        tenant_entry
             .executors
-            .entry((report.executor_id, host.clone()))
+            .entry((executor_id, host.to_string()))
             .or_insert_with(|| ExecutorItem {
-                executor_id: report.executor_id,
+                executor_id,
                 folded: false,
                 watchers: BTreeMap::new(),
-                host: host.clone(),
-            });
-        // keep host updated
-        exec_entry.host = host.clone();
-        let watch = exec_entry
+                host: host.to_string(),
+            })
+    }
+
+    fn get_or_create_watcher(
+        &mut self,
+        tenant: &str,
+        executor_id: i64,
+        watch_id: i64,
+        host: &str,
+        interest: &str,
+    ) -> &mut WatchItem {
+        let exec_entry = self.get_or_create_executor(tenant, executor_id, host);
+        exec_entry
             .watchers
-            .entry(report.watch_id)
+            .entry(watch_id)
             .or_insert_with(|| WatchItem {
-                watch_id: report.watch_id,
+                watch_id,
                 lag: 0,
                 execution_time: 0.0,
                 updated_at: Instant::now(),
-                interest: report.interest.clone(),
+                interest: interest.to_string(),
                 lag_hist: VecDeque::new(),
                 exec_hist: VecDeque::new(),
                 time_hist: VecDeque::new(),
-            });
+            })
+    }
+
+    /// Updates the state of a watcher with the provided `MessageReport` data or creates a new watcher
+    /// if it does not already exist. This function is used to track metrics such as lag, execution time,
+    /// interest, and historical data points for a given host and report details.
+    ///
+    /// # Parameters
+    ///
+    /// * `host` - A `String` representing the host associated with the watcher.
+    /// * `report` - A `MessageReport` containing the details to update the watcher state, including:
+    ///     - `tenant`: The tenant identifier.
+    ///     - `executor_id`: The executor's unique identifier.
+    ///     - `watch_id`: The watcher's unique identifier.
+    ///     - `interest`: The interest string associated with the watcher data.
+    ///     - `lag`: The time lag for the current report.
+    ///     - `execution_time`: The execution time for the current report.
+    ///
+    /// # Functionality
+    ///
+    /// 1. Searches for an existing watcher using the provided `tenant`, `executor_id`, `watch_id`, and `host`.
+    ///    If no watcher exists, it creates a new watcher.
+    /// 2. Updates the watcher's fields:
+    ///     - `lag`: Updates with the report's `lag` value.
+    ///     - `execution_time`: Updates with the report's `execution_time`.
+    ///     - `updated_at`: Sets the current instant as the last updated timestamp.
+    /// 3. Updates the `interest` field, but only if it was previously empty.
+    /// 4. Tracks historical values for time, lag, and execution time:
+    ///     - Appends the current timestamp (in seconds since the UNIX epoch), the report's lag, and execution time
+    ///       to their respective historical collections (`time_hist`, `lag_hist`, `exec_hist`).
+    ///     - Ensures that each historical collection does not exceed a maximum capacity of `MAX_POINTS` (`200`).
+    ///       If necessary, the oldest entries are removed from the front of the collections.
+    ///
+    /// # Constants
+    ///
+    /// * `MAX_POINTS`: The maximum number of historical data points to retain in each of the `time_hist`,
+    ///   `lag_hist`, and `exec_hist` collections. This is set to 200.
+    pub fn apply_report(&mut self, host: String, report: MessageReport) {
+        // Get the watcher or create it with tenant and executor hierarchy if not exist yet
+        let watch = self.get_or_create_watcher(
+            report.tenant.as_str(),
+            report.executor_id,
+            report.watch_id,
+            host.as_str(),
+            report.interest.as_str(),
+        );
         // Update fields
         watch.lag = report.lag;
         watch.execution_time = report.execution_time;
@@ -130,7 +209,10 @@ impl AppState {
         if watch.interest.is_empty() {
             watch.interest = report.interest.clone();
         }
-        // Append to history with a cap to avoid unbounded growth
+        /// A constant that defines the maximum number of points (or elements) allowed.
+        ///
+        /// This is set to a value of `200`, which can be used as a limit or threshold
+        /// in scenarios where a maximum capacity for points needs to be enforced.
         const MAX_POINTS: usize = 200;
         let now_ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -146,50 +228,72 @@ impl AppState {
         }
     }
 
-    pub fn apply_register(&mut self, host: String, reg: MessageRegister) {
-        let tenant_entry = self
-            .tenants
-            .entry(reg.tenant.clone())
-            .or_insert_with(|| TenantItem {
-                tenant: reg.tenant.clone(),
-                folded: false,
-                executors: BTreeMap::new(),
-            });
-        let exec_entry = tenant_entry
-            .executors
-            .entry((reg.executor_id, host.clone()))
-            .or_insert_with(|| ExecutorItem {
-                executor_id: reg.executor_id,
-                folded: false,
-                watchers: BTreeMap::new(),
-                host: host.clone(),
-            });
-        exec_entry.host = host.clone();
-        exec_entry
-            .watchers
-            .entry(reg.watch_id)
-            .or_insert_with(|| WatchItem {
-                watch_id: reg.watch_id,
-                lag: 0,
-                execution_time: 0.0,
-                updated_at: Instant::now(),
-                interest: String::new(),
-                lag_hist: VecDeque::new(),
-                exec_hist: VecDeque::new(),
-                time_hist: VecDeque::new(),
-            });
+    /// Applies a registration message to the system by initializing or retrieving a watcher.
+    ///
+    /// This function processes a given `MessageRegister` and associates it with the specified host.
+    /// If a corresponding watcher does not already exist in the system for the provided `tenant`,
+    /// `executor_id`, and `watch_id`, it will create one under the hierarchy of tenant and executor.
+    ///
+    /// # Arguments
+    ///
+    /// * `host` - A string representing the host associated with the watcher.
+    /// * `message_register` - A `MessageRegister` object containing the registration details,
+    /// including the tenant, executor ID, and watch ID.
+    ///
+    /// # Behavior
+    ///
+    /// If a watcher for the specified tenant/executor/watch ID combination does not exist, it will be
+    /// created with the provided host. The watcher may involve maintaining hierarchical relationships
+    /// between the tenant and executor entities.
+    pub fn apply_register(&mut self, host: String, message_register: MessageRegister) {
+        // create it with tenant and executor hierarchy if not exist yet
+        let _ = self.get_or_create_watcher(
+            message_register.tenant.as_str(),
+            message_register.executor_id,
+            message_register.watch_id,
+            &host,
+            "",
+        );
     }
 
-    pub fn apply_unregister(&mut self, host: String, unreg: MessageUnregister) {
-        if let Some(tenant) = self.tenants.get_mut(&unreg.tenant) {
-            if let Some(exec) = tenant.executors.get_mut(&(unreg.executor_id, host.clone())) {
+    /// Updates the internal state of the system to handle the unregistration of a specific watcher
+    /// for a given executor associated with a tenant.
+    ///
+    /// # Parameters
+    /// - `host`: A `String` representing the host associated with the executor being updated.
+    /// - `message_unregister`: An instance of `MessageUnregister` containing the tenant ID, executor ID, and watch ID
+    ///   to identify the targeted tenant, executor, and watcher respectively.
+    ///
+    /// # Behavior
+    /// - If a tenant matching the tenant ID within `message_unregister` exists in the `tenants` map:
+    ///   - Attempts to find the executor using the `(executor_id, host)` pair.
+    ///   - If the executor is found:
+    ///     - Updates the executor's `host` property to the provided `host`.
+    ///     - Removes the watcher specified by `message_unregister.watch_id` from the executor's `watchers`.
+    ///
+    /// # Notes
+    /// - Does nothing if the provided tenant or executor is not found.
+    /// - Modifies the state of the tenant and executor (if found) by updating fields and removing
+    ///   the watcher.
+    /// - The `tenants`, `executors`, and `watchers` are expected to be mutable, as this function
+    ///   performs in-place updates.
+    ///
+    /// # Use-case
+    /// This function is used to handle unregistration events when a watcher needs to be removed
+    /// from an executor, such as during cleanup or resource management tasks.
+    pub fn apply_unregister(&mut self, host: String, message_unregister: MessageUnregister) {
+        if let Some(tenant) = self.tenants.get_mut(&message_unregister.tenant) {
+            if let Some(exec) = tenant
+                .executors
+                .get_mut(&(message_unregister.executor_id, host.clone()))
+            {
                 exec.host = host;
-                exec.watchers.remove(&unreg.watch_id);
+                exec.watchers.remove(&message_unregister.watch_id);
             }
         }
     }
 
-    // Remove inactive watchers (> max_age since last update) and empty executors/tenants
+    /// Remove inactive watchers (> max_age since last update) and empty executors/tenants
     pub fn prune_inactive(&mut self, max_age: Duration) {
         let now = Instant::now();
         self.tenants.retain(|_tname, tenant| {
@@ -203,28 +307,36 @@ impl AppState {
         });
     }
 
-    // Build visible rows respecting folding
+    /// Build visible rows respecting folding
     pub fn visible_rows(&self) -> Vec<Row<'static>> {
+        // accumulate visible rows
         let mut rows = Vec::new();
-        let tenant_filt = if self.filter.is_empty() {
+
+        // get filter values for tenants
+        let tenant_filter = if self.filter.is_empty() {
             None
         } else {
             Some(self.filter.to_lowercase())
         };
-        let host_filt = if self.host_filter.is_empty() {
+        let host_filter = if self.host_filter.is_empty() {
             None
         } else {
             Some(self.host_filter.to_lowercase())
         };
+
         for (tenant_name, tenant) in &self.tenants {
-            if let Some(ref f) = tenant_filt {
-                if !tenant_name.to_lowercase().contains(f) {
-                    continue;
-                }
+            if !self.filters.is_row_visible(tenant, FilterType::Tenant) {
+                continue;
             }
-            // Compute which executors are visible under host filter
+
+            // if let Some(ref f) = tenant_filter {
+            //     if !tenant_name.to_lowercase().contains(f) {
+            //         continue;
+            //     }
+            // }
+            // Compute which executors are visible under the host filter
             let exec_iter = tenant.executors.iter().filter(|(_id, exec)| {
-                if let Some(ref hf) = host_filt {
+                if let Some(ref hf) = host_filter {
                     exec.host.to_lowercase().contains(hf)
                 } else {
                     true
@@ -554,7 +666,7 @@ pub async fn run_tui(
     use ratatui::crossterm::event::{self, Event, KeyCode};
     use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     use ratatui::crossterm::{execute, terminal};
-    use std::io::{stdout, Stdout};
+    use std::io::{Stdout, stdout};
 
     // Setup terminal
     enable_raw_mode()?;
@@ -568,8 +680,9 @@ pub async fn run_tui(
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = AppState::default();
-    let mut filtering = false;
-    let mut filtering_host = false;
+    app.filters.create_filter(FilterType::Tenant, "Tenant");
+    app.filters.create_filter(FilterType::Host, "Host");
+
     let mut last_prune = Instant::now();
 
     // Aggregator tab state
@@ -704,12 +817,9 @@ pub async fn run_tui(
                     ""
                 };
                 let header_title = format!(
-                    "{}Watchers by Tenant/Executor (q quit, / tenant filter, h host filter, Esc/Enter exit filter, arrows navigate, Enter/Right fold/unfold) | Tenant{}: {} | Host{}: {}",
+                    "{}Watchers by Tenant/Executor (q quit, / tenant filter, h host filter, Esc/Enter exit filter, arrows navigate, Enter/Right fold/unfold) | {}",
                     tab_hint,
-                    if filtering { " [typing]" } else { "" },
-                    if app.filter.is_empty() { "<none>".to_string() } else { app.filter.clone() },
-                    if filtering_host { " [typing]" } else { "" },
-                    if app.host_filter.is_empty() { "<none>".to_string() } else { app.host_filter.clone() }
+                    app.filters.to_string()
                 );
                 let header = Block::default().title(header_title).borders(Borders::ALL);
                 f.render_widget(header, chunks[0]);
@@ -1063,30 +1173,26 @@ pub async fn run_tui(
             match event::read()? {
                 Event::Key(key) => {
                     use ratatui::crossterm::event::KeyCode;
-                    if filtering || filtering_host {
+                    if app.filters.is_filter_active(FilterType::Tenant)
+                        || app.filters.is_filter_active(FilterType::Host)
+                    {
                         match key.code {
                             KeyCode::Char('q') => break,
-                            KeyCode::Esc
-                            | KeyCode::Enter
-                            | KeyCode::Char('/') => {
-                                filtering = false;
-                                filtering_host = false;
+                            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('/') => {
+                                app.filters.clear_filter();
                             }
                             KeyCode::Backspace => {
-                                if filtering_host {
-                                    app.host_filter.pop();
-                                } else {
-                                    app.filter.pop();
-                                }
+                                app.filters.pop_char();
                                 app.selected = 0;
                             }
                             KeyCode::Char(c) => {
                                 if !c.is_control() {
-                                    if filtering_host {
-                                        app.host_filter.push(c);
-                                    } else {
-                                        app.filter.push(c);
-                                    }
+                                    app.filters.push_char(c);
+                                    // if filtering_host {
+                                    //     app.host_filter.push(c);
+                                    // } else {
+                                    //     app.filter.push(c);
+                                    // }
                                     app.selected = 0;
                                 }
                             }
@@ -1099,73 +1205,131 @@ pub async fn run_tui(
                                 KeyCode::Tab => {
                                     // Cycle: Logs -> Main if no aggregator, otherwise Logs -> Main
                                     in_logs_tab = false;
-                                },
+                                }
                                 KeyCode::Char('q') => break,
-                                KeyCode::Char('c') => { logs.clear(); logs_offset = 0; },
+                                KeyCode::Char('c') => {
+                                    logs.clear();
+                                    logs_offset = 0;
+                                }
                                 KeyCode::Up => {
                                     // scroll up
                                     if logs.len() > 0 {
                                         // increase offset up to max
                                         let max_off = logs.len().saturating_sub(1);
-                                        if logs_offset < max_off { logs_offset += 1; }
+                                        if logs_offset < max_off {
+                                            logs_offset += 1;
+                                        }
                                     }
-                                },
+                                }
                                 KeyCode::Down => {
-                                    if logs_offset > 0 { logs_offset -= 1; }
-                                },
+                                    if logs_offset > 0 {
+                                        logs_offset -= 1;
+                                    }
+                                }
                                 _ => {}
                             }
                         } else if aggregator_mode && in_backends_tab {
                             // Backends tab key handling
                             match key.code {
-                                KeyCode::Tab => { if logs_available { in_backends_tab = false; in_logs_tab = true; } else { in_backends_tab = false; } },
+                                KeyCode::Tab => {
+                                    if logs_available {
+                                        in_backends_tab = false;
+                                        in_logs_tab = true;
+                                    } else {
+                                        in_backends_tab = false;
+                                    }
+                                }
                                 KeyCode::Char('p') => {
                                     polling_paused = !polling_paused;
                                     if let Some(ref txc) = control_tx_opt {
-                                        let _ = if polling_paused { txc.send(PollControl::Pause) } else { txc.send(PollControl::Resume) };
+                                        let _ = if polling_paused {
+                                            txc.send(PollControl::Pause)
+                                        } else {
+                                            txc.send(PollControl::Resume)
+                                        };
                                     }
-                                },
+                                }
                                 KeyCode::Char('q') => break,
                                 code => {
                                     if adding_backend {
                                         match code {
-                                            KeyCode::Esc => { adding_backend = false; add_buffer.clear(); },
+                                            KeyCode::Esc => {
+                                                adding_backend = false;
+                                                add_buffer.clear();
+                                            }
                                             KeyCode::Enter => {
-                                                if let Some((addr, port_str)) = add_buffer.split_once(':') {
+                                                if let Some((addr, port_str)) =
+                                                    add_buffer.split_once(':')
+                                                {
                                                     if let Ok(port) = port_str.parse::<u16>() {
                                                         let addr_s = addr.to_string();
-                                                        if !backends.iter().any(|(a,p)| a==&addr_s && *p==port) {
+                                                        if !backends.iter().any(|(a, p)| {
+                                                            a == &addr_s && *p == port
+                                                        }) {
                                                             backends.push((addr_s.clone(), port));
                                                             if let Some(ref txc) = control_tx_opt {
-                                                                let _ = txc.send(PollControl::AddBackend(addr_s.clone(), port));
+                                                                let _ = txc.send(
+                                                                    PollControl::AddBackend(
+                                                                        addr_s.clone(),
+                                                                        port,
+                                                                    ),
+                                                                );
                                                             }
-                                                            backends_sel = backends.len().saturating_sub(1);
+                                                            backends_sel =
+                                                                backends.len().saturating_sub(1);
                                                         }
                                                     }
                                                 }
-                                                adding_backend = false; add_buffer.clear();
-                                            },
-                                            KeyCode::Backspace => { add_buffer.pop(); },
-                                            KeyCode::Char(c) => { if !c.is_control() { add_buffer.push(c); } },
+                                                adding_backend = false;
+                                                add_buffer.clear();
+                                            }
+                                            KeyCode::Backspace => {
+                                                add_buffer.pop();
+                                            }
+                                            KeyCode::Char(c) => {
+                                                if !c.is_control() {
+                                                    add_buffer.push(c);
+                                                }
+                                            }
                                             _ => {}
                                         }
                                     } else {
                                         match code {
-                                            KeyCode::Char('a') => { adding_backend = true; add_buffer.clear(); },
+                                            KeyCode::Char('a') => {
+                                                adding_backend = true;
+                                                add_buffer.clear();
+                                            }
                                             KeyCode::Char('d') => {
-                                                if !backends.is_empty() && backends_sel < backends.len() {
-                                                    let (addr, port) = backends[backends_sel].clone();
-                                                    if let Some(ref txc) = control_tx_opt { let _ = txc.send(PollControl::RemoveBackend(addr.clone(), port)); }
+                                                if !backends.is_empty()
+                                                    && backends_sel < backends.len()
+                                                {
+                                                    let (addr, port) =
+                                                        backends[backends_sel].clone();
+                                                    if let Some(ref txc) = control_tx_opt {
+                                                        let _ =
+                                                            txc.send(PollControl::RemoveBackend(
+                                                                addr.clone(),
+                                                                port,
+                                                            ));
+                                                    }
                                                     backends.remove(backends_sel);
-                                                    if backends_sel >= backends.len() && backends_sel>0 { backends_sel -= 1; }
+                                                    if backends_sel >= backends.len()
+                                                        && backends_sel > 0
+                                                    {
+                                                        backends_sel -= 1;
+                                                    }
                                                 }
-                                            },
+                                            }
                                             KeyCode::Down => {
-                                                if backends_sel + 1 < backends.len() { backends_sel += 1; }
-                                            },
+                                                if backends_sel + 1 < backends.len() {
+                                                    backends_sel += 1;
+                                                }
+                                            }
                                             KeyCode::Up => {
-                                                if backends_sel > 0 { backends_sel -= 1; }
-                                            },
+                                                if backends_sel > 0 {
+                                                    backends_sel -= 1;
+                                                }
+                                            }
                                             _ => {}
                                         }
                                     }
@@ -1175,18 +1339,39 @@ pub async fn run_tui(
                             // Main tab key handling
                             match key.code {
                                 KeyCode::Tab => {
-                                    if aggregator_mode { in_backends_tab = true; }
-                                    else if logs_available { in_logs_tab = true; }
-                                },
+                                    if aggregator_mode {
+                                        in_backends_tab = true;
+                                    } else if logs_available {
+                                        in_logs_tab = true;
+                                    }
+                                }
                                 KeyCode::Char('q') => break,
-                                KeyCode::Char('/') => { filtering = true; filtering_host = false; app.selected = 0; }
-                                KeyCode::Char('h') => { filtering_host = true; filtering = false; app.selected = 0; }
+                                KeyCode::Char('/') => {
+                                    app.filters.set_filter(FilterType::Tenant);
+                                    // filtering = true;
+                                    // filtering_host = false;
+                                    app.selected = 0;
+                                }
+                                KeyCode::Char('h') => {
+                                    app.filters.set_filter(FilterType::Host);
+                                    filtering_host = true;
+                                    filtering = false;
+                                    app.selected = 0;
+                                }
                                 KeyCode::Down => {
                                     let max = app.visible_rows().len();
-                                    if app.selected + 1 < max { app.selected += 1; }
+                                    if app.selected + 1 < max {
+                                        app.selected += 1;
+                                    }
                                 }
-                                KeyCode::Up => { if app.selected > 0 { app.selected -= 1; } }
-                                KeyCode::Right | KeyCode::Enter | KeyCode::Left => { app.toggle_fold_at(app.selected); }
+                                KeyCode::Up => {
+                                    if app.selected > 0 {
+                                        app.selected -= 1;
+                                    }
+                                }
+                                KeyCode::Right | KeyCode::Enter | KeyCode::Left => {
+                                    app.toggle_fold_at(app.selected);
+                                }
                                 _ => {}
                             }
                         }

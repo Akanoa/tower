@@ -4,8 +4,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::join;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, error, info, warn};
 
 const BUFFER_SIZE: usize = 200;
@@ -81,7 +81,13 @@ pub async fn poll_backends(
     let paused = std::sync::Arc::new(tokio::sync::RwLock::new(false));
 
     // Map of backend -> (handle, shutdown_flag)
-    let mut tasks: HashMap<(String, u16), (tokio::task::JoinHandle<()>, std::sync::Arc<tokio::sync::RwLock<bool>>)> = HashMap::new();
+    let mut tasks: HashMap<
+        (String, u16),
+        (
+            tokio::task::JoinHandle<()>,
+            std::sync::Arc<tokio::sync::RwLock<bool>>,
+        ),
+    > = HashMap::new();
 
     // helper to spawn a backend task
     let mut make_backend_task = |addr: String, port: u16| {
@@ -94,12 +100,16 @@ pub async fn poll_backends(
             let mut backoff_secs: u64 = 1;
             let max_backoff: u64 = 30;
             loop {
-                if *shutdown_clone.read().await { break; }
+                if *shutdown_clone.read().await {
+                    break;
+                }
                 match tokio::net::TcpStream::connect(format!("{}:{}", addr_clone, port)).await {
                     Ok(mut stream) => {
                         info!(backend = %format!("{}:{}", addr_clone, port), "Connected to backend");
                         backoff_secs = 1;
-                        if let Err(err) = poll_backend(&mut stream, tx_clone.clone(), paused_flag.clone()).await {
+                        if let Err(err) =
+                            poll_backend(&mut stream, tx_clone.clone(), paused_flag.clone()).await
+                        {
                             warn!(?err, backend = %format!("{}:{}", addr_clone, port), "Polling error, will reconnect");
                         } else {
                             warn!(backend = %format!("{}:{}", addr_clone, port), "Backend disconnected, will reconnect");
@@ -109,7 +119,9 @@ pub async fn poll_backends(
                         warn!(?err, backend = %format!("{}:{}", addr_clone, port), "Failed to connect to backend");
                     }
                 }
-                if *shutdown_clone.read().await { break; }
+                if *shutdown_clone.read().await {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
                 backoff_secs = std::cmp::min(backoff_secs.saturating_mul(2), max_backoff);
             }

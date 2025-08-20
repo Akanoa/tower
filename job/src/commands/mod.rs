@@ -1,8 +1,8 @@
 mod parser;
 
+use crate::Action;
 use crate::errors::JobError;
 use crate::state::State;
-use crate::Action;
 pub use parser::*;
 use protocol::{Message, MessageBody, MessageRegister, MessageUnregister};
 use tokio::io::AsyncWriteExt;

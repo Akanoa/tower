@@ -26,7 +26,10 @@ pub async fn run() -> Result<(), ServerError> {
     }
     impl Clone for LogWriter {
         fn clone(&self) -> Self {
-            LogWriter { tx: self.tx.clone(), buf: Vec::new() }
+            LogWriter {
+                tx: self.tx.clone(),
+                buf: Vec::new(),
+            }
         }
     }
     impl std::io::Write for LogWriter {
@@ -56,7 +59,10 @@ pub async fn run() -> Result<(), ServerError> {
     }
 
     // Initialize tracing subscriber with our writer
-    let make_writer = move || LogWriter { tx: log_tx.clone(), buf: Vec::new() };
+    let make_writer = move || LogWriter {
+        tx: log_tx.clone(),
+        buf: Vec::new(),
+    };
     let _ = tracing_subscriber::fmt()
         .with_writer(make_writer)
         .with_ansi(false)
@@ -73,7 +79,10 @@ pub async fn run() -> Result<(), ServerError> {
     Ok(())
 }
 
-async fn handle_local(args: Local, mut log_rx: mpsc::UnboundedReceiver<String>) -> Result<(), ServerError> {
+async fn handle_local(
+    args: Local,
+    mut log_rx: mpsc::UnboundedReceiver<String>,
+) -> Result<(), ServerError> {
     // channel to forward all messages to TUI
     let (tx, rx) = mpsc::unbounded_channel::<Message>();
     // spawn server socket in background
@@ -108,7 +117,10 @@ async fn handle_proxy(args: Proxy) -> Result<(), ServerError> {
     Ok(())
 }
 
-async fn handle_aggregator(args: Aggregator, mut log_rx: mpsc::UnboundedReceiver<String>) -> Result<(), ServerError> {
+async fn handle_aggregator(
+    args: Aggregator,
+    mut log_rx: mpsc::UnboundedReceiver<String>,
+) -> Result<(), ServerError> {
     // channel to forward all messages to TUI
     let (tx, rx) = mpsc::unbounded_channel::<Message>();
     // control channel for backend polling management
@@ -122,7 +134,10 @@ async fn handle_aggregator(args: Aggregator, mut log_rx: mpsc::UnboundedReceiver
     });
 
     // Prepare aggregator tab config for TUI (pass the only sender to TUI)
-    let tui_cfg = interface::AggregatorTabConfig { backends: args.backends.clone(), control_tx: ctrl_tx };
+    let tui_cfg = interface::AggregatorTabConfig {
+        backends: args.backends.clone(),
+        control_tx: ctrl_tx,
+    };
 
     // Run TUI in foreground
     if let Err(err) = interface::run_tui(rx, Some(tui_cfg), Some(log_rx)).await {
