@@ -2,12 +2,12 @@ use crate::interface::filters::{FilterType, Rowable};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
+use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use crate::tcp_server::PollControl;
@@ -666,7 +666,7 @@ pub async fn run_tui(
     use ratatui::crossterm::event::{self, Event, KeyCode};
     use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     use ratatui::crossterm::{execute, terminal};
-    use std::io::{Stdout, stdout};
+    use std::io::{stdout, Stdout};
 
     // Setup terminal
     enable_raw_mode()?;
@@ -1354,8 +1354,6 @@ pub async fn run_tui(
                                 }
                                 KeyCode::Char('h') => {
                                     app.filters.set_filter(FilterType::Host);
-                                    filtering_host = true;
-                                    filtering = false;
                                     app.selected = 0;
                                 }
                                 KeyCode::Down => {
