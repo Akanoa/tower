@@ -438,7 +438,7 @@ impl AppState {
             let mut any_exec_visible = false;
             for (_eid, executor) in tenant.executors.iter() {
                 // the executor is filtered by host
-                if !self.filters.is_row_visible(executor, FilterType::Host) {
+                if self.filters.is_row_visible(executor, FilterType::Host) {
                     any_exec_visible = true;
                     break;
                 }
