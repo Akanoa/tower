@@ -10,10 +10,15 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
+use crate::interface::tenant_item::TenantStatistics;
 use crate::tcp_server::PollControl;
 use protocol::{Message, MessageBody, MessageRegister, MessageReport, MessageUnregister};
+use tenant_item::TenantItem;
 
 mod filters;
+mod tenant_item;
+
+type ExecutorKey = (i64, String);
 
 // Resample a u64 series to exactly `width` points for visual stretching in sparklines
 fn resample_to_width_u64(values: &[u64], width: usize) -> Vec<u64> {
@@ -74,19 +79,6 @@ pub struct ExecutorItem {
 impl Rowable for ExecutorItem {
     fn get_filterable_data(&self) -> &str {
         self.host.as_str()
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct TenantItem {
-    pub tenant: String,
-    pub folded: bool,
-    pub executors: BTreeMap<(i64, String), ExecutorItem>,
-}
-
-impl Rowable for TenantItem {
-    fn get_filterable_data(&self) -> &str {
-        self.tenant.as_str()
     }
 }
 
@@ -312,66 +304,33 @@ impl AppState {
         // accumulate visible rows
         let mut rows = Vec::new();
 
-        // get filter values for tenants
-        let tenant_filter = if self.filter.is_empty() {
-            None
-        } else {
-            Some(self.filter.to_lowercase())
-        };
-        let host_filter = if self.host_filter.is_empty() {
-            None
-        } else {
-            Some(self.host_filter.to_lowercase())
-        };
-
         for (tenant_name, tenant) in &self.tenants {
+            // Filter out tenants
             if !self.filters.is_row_visible(tenant, FilterType::Tenant) {
                 continue;
             }
-
-            // if let Some(ref f) = tenant_filter {
-            //     if !tenant_name.to_lowercase().contains(f) {
-            //         continue;
-            //     }
-            // }
             // Compute which executors are visible under the host filter
-            let exec_iter = tenant.executors.iter().filter(|(_id, exec)| {
-                if let Some(ref hf) = host_filter {
-                    exec.host.to_lowercase().contains(hf)
-                } else {
-                    true
-                }
-            });
+            let exec_iter = tenant
+                .executors
+                .iter()
+                .filter(|(_id, exec)| self.filters.is_row_visible(*exec, FilterType::Host));
             // We need to peek whether there is any executor to show; collect ids temporarily
-            let visible_execs: Vec<(&(i64, String), &ExecutorItem)> = exec_iter.collect();
+            let visible_execs: Vec<(&ExecutorKey, &ExecutorItem)> = exec_iter.collect();
             if visible_execs.is_empty() {
-                // Skip tenant entirely if no executor matches host filter
+                // Skip tenant entirely if no executor matches the host filter
                 continue;
             }
             let t_prefix = if tenant.folded { "▸" } else { "▾" };
-            // Compute tenant-level means based on means of its visible executors (with watchers)
-            let (tenant_mean_lag, tenant_mean_exec) = {
-                let mut sum_mean_lag = 0.0_f64;
-                let mut sum_mean_exec = 0.0_f64;
-                let mut count = 0.0_f64;
-                for (_key, exec) in &visible_execs {
-                    let n = exec.watchers.len() as f64;
-                    if n > 0.0 {
-                        let sum_lag: u128 = exec.watchers.values().map(|w| w.lag as u128).sum();
-                        let sum_exec: f64 = exec.watchers.values().map(|w| w.execution_time).sum();
-                        let mean_lag = sum_lag as f64 / n;
-                        let mean_exec = sum_exec / n;
-                        sum_mean_lag += mean_lag;
-                        sum_mean_exec += mean_exec;
-                        count += 1.0;
-                    }
-                }
-                if count > 0.0 {
-                    ((sum_mean_lag / count).round() as u64, sum_mean_exec / count)
-                } else {
-                    (0u64, 0.0f64)
-                }
-            };
+
+            let executors: Vec<&ExecutorItem> =
+                visible_execs.iter().map(|(_id, exec)| *exec).collect();
+            let stats = tenant.get_statistics(&executors);
+
+            let TenantStatistics {
+                mean_lag: tenant_mean_lag,
+                mean_execution_time: tenant_mean_exec,
+            } = stats;
+
             rows.push(
                 Row::new(vec![
                     Cell::from(Line::from(format!("{t_prefix} Tenant: {tenant_name}"))),
