@@ -9,14 +9,16 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
+use ratatui::widgets::{Block, Borders, Paragraph, Row, Sparkline, Table};
 use ratatui::Terminal;
 use tenant_item::TenantItem;
 use tokio::sync::mpsc;
+use watch_item::WatchItem;
 
 mod executor_item;
 mod filters;
 mod tenant_item;
+mod watch_item;
 
 type ExecutorKey = (i64, String);
 
@@ -54,18 +56,6 @@ pub type MessageReceiver = mpsc::UnboundedReceiver<Message>;
 pub struct AggregatorTabConfig {
     pub backends: Vec<(String, u16)>,
     pub control_tx: mpsc::UnboundedSender<PollControl>,
-}
-
-#[derive(Debug, Clone)]
-pub struct WatchItem {
-    pub watch_id: i64,
-    pub lag: u64,
-    pub execution_time: f64,
-    pub updated_at: Instant,
-    pub interest: String,
-    pub lag_hist: VecDeque<u64>,
-    pub exec_hist: VecDeque<f64>,
-    pub time_hist: VecDeque<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -307,74 +297,27 @@ impl AppState {
                 continue;
             }
 
+            // add the row displaying the tenant in the table
             let executors: Vec<&ExecutorItem> =
                 visible_execs.iter().map(|(_id, exec)| *exec).collect();
-
             rows.push(tenant.as_row(&executors));
+
+            // If the tenant is folded, all executors are hidden
             if tenant.folded {
                 continue;
             }
+
             for (exec_id, exec) in visible_execs {
-                let e_prefix = if exec.folded { "  ▸" } else { "  ▾" };
-                // Compute means from current watcher values
-                let n = exec.watchers.len() as f64;
-                let (mean_lag, mean_exec) = if n > 0.0 {
-                    let sum_lag: u128 = exec.watchers.values().map(|w| w.lag as u128).sum();
-                    let sum_exec: f64 = exec.watchers.values().map(|w| w.execution_time).sum();
-                    ((sum_lag as f64 / n).round() as u64, sum_exec / n)
-                } else {
-                    (0u64, 0.0f64)
-                };
-                rows.push(Row::new(vec![
-                    Cell::from(Line::from(format!("{e_prefix} Executor #{}", exec_id.0))),
-                    {
-                        let style = if mean_lag > 10_000 {
-                            Style::default().fg(Color::Red)
-                        } else {
-                            Style::default()
-                        };
-                        Cell::from(Line::from(format!("{}", mean_lag))).style(style)
-                    },
-                    {
-                        let style = if mean_exec > 1000.0 {
-                            Style::default().fg(Color::Red)
-                        } else {
-                            Style::default()
-                        };
-                        Cell::from(Line::from(format!("{:.3} ms", mean_exec))).style(style)
-                    },
-                    Cell::from(Line::from("")),
-                    Cell::from(Line::from(exec.host.clone())),
-                ]));
+                // add the row displaying the executor in the table
+                rows.push(exec.as_row());
+
+                // If the executor is folded, all watchers are hidden
                 if exec.folded {
                     continue;
                 }
                 for (_watch_id, watch) in &exec.watchers {
-                    rows.push(Row::new(vec![
-                        Cell::from(Line::from(format!("      Watch #{:}", watch.watch_id))),
-                        {
-                            let style = if watch.lag > 10_000 {
-                                Style::default().fg(Color::Red)
-                            } else {
-                                Style::default()
-                            };
-                            Cell::from(Line::from(format!("{}", watch.lag))).style(style)
-                        },
-                        {
-                            let style = if watch.execution_time > 1000.0 {
-                                Style::default().fg(Color::Red)
-                            } else {
-                                Style::default()
-                            };
-                            Cell::from(Line::from(format!("{:.3} ms", watch.execution_time)))
-                                .style(style)
-                        },
-                        Cell::from(Line::from(format!(
-                            "{:?}",
-                            Instant::now().saturating_duration_since(watch.updated_at)
-                        ))),
-                        Cell::from(Line::from("")),
-                    ]));
+                    // add the row displaying the watcher in the table
+                    rows.push(watch.as_row());
                 }
             }
         }
