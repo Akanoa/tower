@@ -327,37 +327,26 @@ impl AppState {
     // Toggle fold state for the item at the visible index, if it's a tenant or executor row
     pub fn toggle_fold_at(&mut self, index: usize) {
         let mut i = 0usize;
-        let tenant_filt = if self.filter.is_empty() {
-            None
-        } else {
-            Some(self.filter.to_lowercase())
-        };
-        let host_filt = if self.host_filter.is_empty() {
-            None
-        } else {
-            Some(self.host_filter.to_lowercase())
-        };
-        for (tenant_name, tenant) in self.tenants.iter_mut() {
-            if let Some(ref f) = tenant_filt {
-                if !tenant_name.to_lowercase().contains(f) {
-                    continue;
-                }
+        for (_tenant_name, tenant) in self.tenants.iter_mut() {
+            // If the row is hidden, then don't take it in an account in folding compute
+            if !self.filters.is_row_visible(tenant, FilterType::Tenant) {
+                continue;
             }
+
             // determine if tenant has any execs visible under host filter
             let mut any_exec_visible = false;
-            for (_eid, e) in tenant.executors.iter() {
-                if host_filt
-                    .as_ref()
-                    .map(|hf| e.host.to_lowercase().contains(hf))
-                    .unwrap_or(true)
-                {
+            for (_eid, executor) in tenant.executors.iter() {
+                // at least on executor matches the host filter
+                if self.filters.is_row_visible(executor, FilterType::Host) {
                     any_exec_visible = true;
                     break;
                 }
             }
+            // If no executors match the host filter, the all tenant can skip
             if !any_exec_visible {
                 continue;
             }
+
             if i == index {
                 tenant.folded = !tenant.folded;
                 return;
@@ -367,10 +356,9 @@ impl AppState {
                 continue;
             }
             for (_exec_id, exec) in tenant.executors.iter_mut() {
-                if let Some(ref hf) = host_filt {
-                    if !exec.host.to_lowercase().contains(hf) {
-                        continue;
-                    }
+                // the executor is filtered by host
+                if !self.filters.is_row_visible(exec, FilterType::Host) {
+                    continue;
                 }
                 if i == index {
                     exec.folded = !exec.folded;
@@ -389,30 +377,17 @@ impl AppState {
     // Resolve current selection to a watcher identifier if selection points to a watcher row
     pub fn selected_watch_ids(&self) -> Option<(String, (i64, String), i64)> {
         let mut i = 0usize;
-        let tenant_filt = if self.filter.is_empty() {
-            None
-        } else {
-            Some(self.filter.to_lowercase())
-        };
-        let host_filt = if self.host_filter.is_empty() {
-            None
-        } else {
-            Some(self.host_filter.to_lowercase())
-        };
         for (tenant_name, tenant) in &self.tenants {
-            if let Some(ref f) = tenant_filt {
-                if !tenant_name.to_lowercase().contains(f) {
-                    continue;
-                }
+            // If the row is hidden, then don't take it in an account in folding compute
+            if !self.filters.is_row_visible(tenant, FilterType::Tenant) {
+                continue;
             }
+
             // Only consider tenants with at least one visible executor under host filter
             let mut any_exec_visible = false;
-            for (_eid, e) in tenant.executors.iter() {
-                if host_filt
-                    .as_ref()
-                    .map(|hf| e.host.to_lowercase().contains(hf))
-                    .unwrap_or(true)
-                {
+            for (_eid, executor) in tenant.executors.iter() {
+                // at least on executor matches the host filter
+                if self.filters.is_row_visible(executor, FilterType::Host) {
                     any_exec_visible = true;
                     break;
                 }
@@ -429,10 +404,9 @@ impl AppState {
                 continue;
             }
             for (exec_id, exec) in &tenant.executors {
-                if let Some(ref hf) = host_filt {
-                    if !exec.host.to_lowercase().contains(hf) {
-                        continue;
-                    }
+                // the executor is filtered by host
+                if !self.filters.is_row_visible(exec, FilterType::Host) {
+                    continue;
                 }
                 if i == self.selected {
                     return None;
@@ -455,30 +429,16 @@ impl AppState {
     // If selection is on a tenant row, return its name; otherwise None
     pub fn selected_tenant_name(&self) -> Option<String> {
         let mut i = 0usize;
-        let tenant_filt = if self.filter.is_empty() {
-            None
-        } else {
-            Some(self.filter.to_lowercase())
-        };
-        let host_filt = if self.host_filter.is_empty() {
-            None
-        } else {
-            Some(self.host_filter.to_lowercase())
-        };
         for (tenant_name, tenant) in &self.tenants {
-            if let Some(ref f) = tenant_filt {
-                if !tenant_name.to_lowercase().contains(f) {
-                    continue;
-                }
+            // If the row is hidden, then don't take it in an account in folding compute
+            if !self.filters.is_row_visible(tenant, FilterType::Tenant) {
+                continue;
             }
             // Consider only tenants with at least one visible executor under host filter
             let mut any_exec_visible = false;
-            for (_eid, e) in tenant.executors.iter() {
-                if host_filt
-                    .as_ref()
-                    .map(|hf| e.host.to_lowercase().contains(hf))
-                    .unwrap_or(true)
-                {
+            for (_eid, executor) in tenant.executors.iter() {
+                // the executor is filtered by host
+                if !self.filters.is_row_visible(executor, FilterType::Host) {
                     any_exec_visible = true;
                     break;
                 }
@@ -495,10 +455,9 @@ impl AppState {
                 continue;
             }
             for (_exec_id, exec) in &tenant.executors {
-                if let Some(ref hf) = host_filt {
-                    if !exec.host.to_lowercase().contains(hf) {
-                        continue;
-                    }
+                // the executor is filtered by host
+                if !self.filters.is_row_visible(exec, FilterType::Host) {
+                    continue;
                 }
                 if i == self.selected {
                     // executor row selected
