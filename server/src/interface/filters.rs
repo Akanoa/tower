@@ -102,6 +102,10 @@ impl Filters {
         }
     }
 
+    pub fn is_active(&self) -> bool {
+        self.active_filter.is_some()
+    }
+
     /// Pushes a character to the active filter's buffer, if an active filter is set and exists in the filters map.
     ///
     /// # Parameters
@@ -211,7 +215,7 @@ impl Filters {
     /// This method updates the `active_filter` field of the instance, effectively
     /// removing any previously applied filter. Typically, this is used when no filtering
     /// criteria need to be applied anymore.
-    pub fn clear_filter(&mut self) {
+    pub fn disable_filter(&mut self) {
         self.active_filter = None;
     }
 

@@ -2,7 +2,7 @@ use crate::cli::{Action, Aggregator, Cli, Local, Proxy};
 use crate::error::ServerError;
 use clap::Parser;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixListener;
 use tokio::select;
 use tracing::{debug, error, info, warn};
 

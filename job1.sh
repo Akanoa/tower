@@ -1,1 +1,1 @@
-cargo run -p job -- --socket host1.sock --file command.txt --host host1
+cargo run -p job -- --socket host2.sock --file command2.txt --host host2

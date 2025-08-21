@@ -1,11 +1,12 @@
 use crate::error::ServerError;
+use crate::interface::BackendIdentifier;
 use protocol::Message;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::join;
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 const BUFFER_SIZE: usize = 200;
@@ -81,13 +82,8 @@ pub async fn poll_backends(
     let paused = std::sync::Arc::new(tokio::sync::RwLock::new(false));
 
     // Map of backend -> (handle, shutdown_flag)
-    let mut tasks: HashMap<
-        (String, u16),
-        (
-            tokio::task::JoinHandle<()>,
-            std::sync::Arc<tokio::sync::RwLock<bool>>,
-        ),
-    > = HashMap::new();
+    let mut tasks: HashMap<BackendIdentifier, (tokio::task::JoinHandle<()>, Arc<RwLock<bool>>)> =
+        HashMap::new();
 
     // helper to spawn a backend task
     let mut make_backend_task = |addr: String, port: u16| {
@@ -147,7 +143,7 @@ pub async fn poll_backends(
                 *paused.write().await = false;
                 info!("Polling resumed by user");
             }
-            PollControl::AddBackend(addr, port) => {
+            PollControl::AddBackend((addr, port)) => {
                 if !tasks.contains_key(&(addr.clone(), port)) {
                     info!(backend = %format!("{}:{}", addr, port), "Adding backend");
                     let (k, v) = make_backend_task(addr, port);
@@ -156,7 +152,7 @@ pub async fn poll_backends(
                     debug!("Backend already exists");
                 }
             }
-            PollControl::RemoveBackend(addr, port) => {
+            PollControl::RemoveBackend((addr, port)) => {
                 if let Some((handle, shutdown)) = tasks.remove(&(addr.clone(), port)) {
                     info!(backend = %format!("{}:{}", addr, port), "Removing backend");
                     *shutdown.write().await = true;
@@ -255,8 +251,8 @@ async fn poll_backend(
 pub enum PollControl {
     Pause,
     Resume,
-    AddBackend(String, u16),
-    RemoveBackend(String, u16),
+    AddBackend(BackendIdentifier),
+    RemoveBackend(BackendIdentifier),
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use crate::interface::filters::FilterType;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::interface::rendering::Rendering;
+use crate::interface::tab_state::Rendering;
 use crate::tcp_server::PollControl;
 use executor_item::ExecutorItem;
 use protocol::{Message, MessageBody, MessageRegister, MessageReport, MessageUnregister};
@@ -18,17 +18,19 @@ use watch_item::WatchItem;
 mod executor_item;
 mod filters;
 mod maths;
-mod rendering;
+mod tab_state;
 mod tenant_item;
 mod watch_item;
 
 type ExecutorKey = (i64, String);
 
+pub type BackendIdentifier = (String, u16);
+
 pub type MessageReceiver = mpsc::UnboundedReceiver<Message>;
 
 #[derive(Clone)]
 pub struct AggregatorTabConfig {
-    pub backends: Vec<(String, u16)>,
+    pub backends: Vec<BackendIdentifier>,
     pub control_tx: mpsc::UnboundedSender<PollControl>,
 }
 
@@ -53,7 +55,7 @@ enum RowPos {
 pub struct AppState {
     pub tenants: BTreeMap<String, TenantItem>,
     // index of the currently selected visible row in flat view
-    pub selected: usize,
+    pub selected_row: usize,
     // current host filter (case-insensitive contains)
     pub host_filter: String,
     // vertical scroll offset for the main table
@@ -61,6 +63,7 @@ pub struct AppState {
     // rows filters
     pub filters: filters::Filters,
     pub rendering: Rendering,
+    pub backends: Vec<BackendIdentifier>,
 }
 
 impl AppState {
@@ -114,6 +117,24 @@ impl AppState {
                 exec_hist: VecDeque::new(),
                 time_hist: VecDeque::new(),
             })
+    }
+
+    /// Reset the visible row cursor
+    fn reset_selected_row(&mut self) {
+        self.selected_row = 0;
+    }
+
+    fn increase_selected_row(&mut self) {
+        let max = self.visible_rows().len();
+        if self.selected_row < max {
+            self.selected_row += 1;
+        }
+    }
+
+    fn decrease_selected_row(&mut self) {
+        if self.selected_row > 0 {
+            self.selected_row -= 1;
+        }
     }
 
     /// Updates the state of a watcher with the provided `MessageReport` data or creates a new watcher
@@ -400,7 +421,7 @@ impl AppState {
 
     // Resolve the current selection to a watcher identifier if selection points to a watcher row
     pub fn selected_watch_ids(&self) -> Option<(String, (i64, String), i64)> {
-        match self.visible_row_at(self.selected) {
+        match self.visible_row_at(self.selected_row) {
             Some(RowPos::Watcher {
                 tenant_name,
                 exec_id,
@@ -412,7 +433,7 @@ impl AppState {
 
     // If selection is on a tenant row, return its name; otherwise None
     pub fn selected_tenant_name(&self) -> Option<String> {
-        match self.visible_row_at(self.selected) {
+        match self.visible_row_at(self.selected_row) {
             Some(RowPos::Tenant { tenant_name }) => Some(tenant_name),
             _ => None,
         }
@@ -449,7 +470,7 @@ pub async fn run_tui(
     // Aggregator tab state
     let aggregator_mode = aggregator.is_some();
     let logs_available = logs_rx.is_some();
-    let (mut backends, control_tx_opt) = if let Some(cfg) = aggregator.clone() {
+    let (backends, control_tx_opt) = if let Some(cfg) = aggregator.clone() {
         (cfg.backends, Some(cfg.control_tx))
     } else {
         (Vec::new(), None)
@@ -460,6 +481,7 @@ pub async fn run_tui(
     let mut backends_sel: usize = 0;
     let mut adding_backend = false;
     let mut add_buffer = String::new();
+    app.backends = backends;
 
     // Logs state
     let mut logs: VecDeque<String> = VecDeque::new();
@@ -497,7 +519,6 @@ pub async fn run_tui(
         terminal.draw(|frame| {
             app.render(
                 frame,
-                &backends,
                 aggregator_mode,
                 logs_available,
                 &in_logs_tab,
@@ -517,16 +538,16 @@ pub async fn run_tui(
                         match key.code {
                             KeyCode::Char('q') => break,
                             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('/') => {
-                                app.filters.clear_filter();
+                                app.filters.disable_filter();
                             }
                             KeyCode::Backspace => {
                                 app.filters.pop_char();
-                                app.selected = 0;
+                                app.selected_row = 0;
                             }
                             KeyCode::Char(c) => {
                                 if !c.is_control() {
                                     app.filters.push_char(c);
-                                    app.selected = 0;
+                                    app.selected_row = 0;
                                 }
                             }
                             _ => {}
@@ -596,20 +617,23 @@ pub async fn run_tui(
                                                 {
                                                     if let Ok(port) = port_str.parse::<u16>() {
                                                         let addr_s = addr.to_string();
-                                                        if !backends.iter().any(|(a, p)| {
+                                                        if !app.backends.iter().any(|(a, p)| {
                                                             a == &addr_s && *p == port
                                                         }) {
-                                                            backends.push((addr_s.clone(), port));
+                                                            app.backends
+                                                                .push((addr_s.clone(), port));
                                                             if let Some(ref txc) = control_tx_opt {
                                                                 let _ = txc.send(
-                                                                    PollControl::AddBackend(
+                                                                    PollControl::AddBackend((
                                                                         addr_s.clone(),
                                                                         port,
-                                                                    ),
+                                                                    )),
                                                                 );
                                                             }
-                                                            backends_sel =
-                                                                backends.len().saturating_sub(1);
+                                                            backends_sel = app
+                                                                .backends
+                                                                .len()
+                                                                .saturating_sub(1);
                                                         }
                                                     }
                                                 }
@@ -633,20 +657,20 @@ pub async fn run_tui(
                                                 add_buffer.clear();
                                             }
                                             KeyCode::Char('d') => {
-                                                if !backends.is_empty()
-                                                    && backends_sel < backends.len()
+                                                if !app.backends.is_empty()
+                                                    && backends_sel < app.backends.len()
                                                 {
                                                     let (addr, port) =
-                                                        backends[backends_sel].clone();
+                                                        app.backends[backends_sel].clone();
                                                     if let Some(ref txc) = control_tx_opt {
                                                         let _ =
-                                                            txc.send(PollControl::RemoveBackend(
+                                                            txc.send(PollControl::RemoveBackend((
                                                                 addr.clone(),
                                                                 port,
-                                                            ));
+                                                            )));
                                                     }
-                                                    backends.remove(backends_sel);
-                                                    if backends_sel >= backends.len()
+                                                    app.backends.remove(backends_sel);
+                                                    if backends_sel >= app.backends.len()
                                                         && backends_sel > 0
                                                     {
                                                         backends_sel -= 1;
@@ -654,7 +678,7 @@ pub async fn run_tui(
                                                 }
                                             }
                                             KeyCode::Down => {
-                                                if backends_sel + 1 < backends.len() {
+                                                if backends_sel + 1 < app.backends.len() {
                                                     backends_sel += 1;
                                                 }
                                             }
@@ -683,25 +707,25 @@ pub async fn run_tui(
                                     app.filters.set_filter(FilterType::Tenant);
                                     // filtering = true;
                                     // filtering_host = false;
-                                    app.selected = 0;
+                                    app.selected_row = 0;
                                 }
                                 KeyCode::Char('h') => {
                                     app.filters.set_filter(FilterType::Host);
-                                    app.selected = 0;
+                                    app.selected_row = 0;
                                 }
                                 KeyCode::Down => {
                                     let max = app.visible_rows().len();
-                                    if app.selected + 1 < max {
-                                        app.selected += 1;
+                                    if app.selected_row + 1 < max {
+                                        app.selected_row += 1;
                                     }
                                 }
                                 KeyCode::Up => {
-                                    if app.selected > 0 {
-                                        app.selected -= 1;
+                                    if app.selected_row > 0 {
+                                        app.selected_row -= 1;
                                     }
                                 }
                                 KeyCode::Right | KeyCode::Enter | KeyCode::Left => {
-                                    app.toggle_fold_at(app.selected);
+                                    app.toggle_fold_at(app.selected_row);
                                 }
                                 _ => {}
                             }
@@ -730,7 +754,6 @@ impl AppState {
     fn render(
         &mut self,
         frame: &mut Frame,
-        backends: &Vec<(String, u16)>,
         aggregator_mode: bool,
         logs_available: bool,
         in_logs_tab: &bool,
@@ -807,11 +830,11 @@ impl AppState {
                 ])
                 .style(Style::default().add_modifier(Modifier::BOLD)),
             );
-            if backends_sel >= backends.len() && !backends.is_empty() {
-                backends_sel = backends.len() - 1;
+            if backends_sel >= self.backends.len() && !self.backends.is_empty() {
+                backends_sel = self.backends.len() - 1;
             }
             let sel_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
-            for (i, (addr, port)) in backends.iter().enumerate() {
+            for (i, (addr, port)) in self.backends.iter().enumerate() {
                 let mut row = Row::new(vec![
                     Line::from(addr.clone()),
                     Line::from(port.to_string()),
@@ -861,8 +884,8 @@ impl AppState {
             // Build all rows
             let rows_full = self.visible_rows();
             // Clamp selection if rows shrink (e.g., after folding)
-            if !rows_full.is_empty() && self.selected >= rows_full.len() {
-                self.selected = rows_full.len() - 1;
+            if !rows_full.is_empty() && self.selected_row >= rows_full.len() {
+                self.selected_row = rows_full.len() - 1;
             }
             let selected_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
             let widths = [
@@ -902,10 +925,10 @@ impl AppState {
                         frame.render_widget(table, table_area);
                     } else {
                         // Keep selected within scroll window
-                        if self.selected < self.scroll_offset {
-                            self.scroll_offset = self.selected;
-                        } else if self.selected >= self.scroll_offset + page_size {
-                            self.scroll_offset = self.selected + 1 - page_size;
+                        if self.selected_row < self.scroll_offset {
+                            self.scroll_offset = self.selected_row;
+                        } else if self.selected_row >= self.scroll_offset + page_size {
+                            self.scroll_offset = self.selected_row + 1 - page_size;
                         }
                         let rows_slice: Vec<Row<'static>> = rows_full
                             .iter()
@@ -914,7 +937,7 @@ impl AppState {
                             .skip(self.scroll_offset)
                             .take(page_size)
                             .map(|(i, row)| {
-                                if i == self.selected {
+                                if i == self.selected_row {
                                     row.clone().style(selected_style)
                                 } else {
                                     row
@@ -1190,10 +1213,10 @@ impl AppState {
                             .block(Block::default().borders(Borders::ALL));
                         frame.render_widget(table, table_area);
                     } else {
-                        if self.selected < self.scroll_offset {
-                            self.scroll_offset = self.selected;
-                        } else if self.selected >= self.scroll_offset + page_size {
-                            self.scroll_offset = self.selected + 1 - page_size;
+                        if self.selected_row < self.scroll_offset {
+                            self.scroll_offset = self.selected_row;
+                        } else if self.selected_row >= self.scroll_offset + page_size {
+                            self.scroll_offset = self.selected_row + 1 - page_size;
                         }
                         let rows_slice: Vec<Row<'static>> = rows_full
                             .iter()
@@ -1202,7 +1225,7 @@ impl AppState {
                             .skip(self.scroll_offset)
                             .take(page_size)
                             .map(|(i, row)| {
-                                if i == self.selected {
+                                if i == self.selected_row {
                                     row.clone().style(selected_style)
                                 } else {
                                     row
@@ -1296,10 +1319,10 @@ impl AppState {
                         .block(Block::default().borders(Borders::ALL));
                     frame.render_widget(table, table_area);
                 } else {
-                    if self.selected < self.scroll_offset {
-                        self.scroll_offset = self.selected;
-                    } else if self.selected >= self.scroll_offset + page_size {
-                        self.scroll_offset = self.selected + 1 - page_size;
+                    if self.selected_row < self.scroll_offset {
+                        self.scroll_offset = self.selected_row;
+                    } else if self.selected_row >= self.scroll_offset + page_size {
+                        self.scroll_offset = self.selected_row + 1 - page_size;
                     }
                     let rows_slice: Vec<Row<'static>> = rows_full
                         .iter()
@@ -1308,7 +1331,7 @@ impl AppState {
                         .skip(self.scroll_offset)
                         .take(page_size)
                         .map(|(i, row)| {
-                            if i == self.selected {
+                            if i == self.selected_row {
                                 row.clone().style(selected_style)
                             } else {
                                 row
