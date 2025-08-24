@@ -54,10 +54,50 @@ impl TabState {
         self.tab == tab
     }
 
-    pub fn handle_key_event(&mut self, app_state: &mut AppState) -> std::io::Result<()> {
+    /// Handles key events for the application, delegating specific actions
+    /// based on the current `Tab` and `AppState`.
+    ///
+    /// This function listens for key events using a timeout, determines if the key
+    /// event is relevant, and processes the event accordingly. If no key event
+    /// is detected within the timeout period, it returns indicating no activity.
+    ///
+    /// # Arguments
+    ///
+    /// * `&mut self` - A mutable reference to the current instance of the
+    ///   application handler, which manages state and input handling.
+    /// * `app_state: &mut AppState` - A mutable reference to the application's global
+    ///   state, which might be altered based on the received key event.
+    ///
+    /// # Returns
+    ///
+    /// Returns an ` std::io::Result < bool >`:
+    /// * `Ok(false)` - Indicates that no event was handled or no action resulted in quitting.
+    /// * `Ok(true)` - Indicates an action was handled and requires the application to quit.
+    /// * `Err(std::io::Error)` - Propagates any I/O errors encountered during polling
+    ///   or reading key events.
+    ///
+    /// # Behavior
+    ///
+    /// - If no key event is polled within the 100 ms timeout duration, the function returns `Ok(false)`.
+    /// - If a non-key event is received, the function ignores it and returns `Ok(false)`.
+    /// - Depending on the current `Tab` the application is on, the key event is delegated
+    ///   to specific handler functions:
+    ///     - `handle_key_event_main_view`: Processes events in the `Main` tab.
+    ///     - `handle_key_event_backends_view`: Processes events in the `Backends` tab
+    ///       (only applicable for `TuiRender::Aggregator` mode).
+    ///     - `handle_key_event_logs_view`: Processes events in the `Logs` tab.
+    /// - If the `Tab::Backends` tab is selected but the `TuiRender` mode is not
+    ///   `Aggregator`, no action is taken for the key event.
+    ///
+    /// # Errors
+    ///
+    /// The function may return an `Err` in case of I/O-related issues:
+    /// * During the polling of an event (`event::poll`).
+    /// * While reading the event (`event::read`).
+    pub fn handle_key_event(&mut self, app_state: &mut AppState) -> std::io::Result<bool> {
         // If no key event available return
         if !event::poll(Duration::from_millis(100))? {
-            return Ok(());
+            return Ok(false);
         }
 
         // Get the first available event
@@ -65,43 +105,55 @@ impl TabState {
 
         // We only handle key events
         let Event::Key(key) = event else {
-            return Ok(());
+            return Ok(false);
         };
 
-        match self.tab {
+        let should_quit = match self.tab {
             Tab::Main => self.handle_key_event_main_view(key, app_state),
             Tab::Backends if matches!(self.render, TuiRender::Aggregator) => {
                 self.handle_key_event_backends_view(key, app_state)
             }
             Tab::Backends => {
                 // backends only exist for aggregator mode
+                false
             }
             Tab::Logs => self.handle_key_event_logs_view(key, app_state),
         };
-        Ok(())
+        Ok(should_quit)
     }
 
-    fn handle_key_event_main_view(&mut self, key: KeyEvent, app_state: &mut AppState) {
+    fn handle_key_event_main_view(&mut self, key: KeyEvent, app_state: &mut AppState) -> bool {
         if app_state.filters.is_active() {
-            return self.handle_key_event_main_view_filtering(key, app_state);
+            self.handle_key_event_main_view_filtering(key, app_state);
+            return false;
         }
 
         match key.code {
             // cycle between tabs
-            event::KeyCode::Tab => self.cycle(),
-            event::KeyCode::Char('q') => std::process::exit(0),
+            event::KeyCode::Tab => {
+                self.cycle();
+                false
+            }
+            event::KeyCode::Char('q') => true,
             event::KeyCode::Char('/') => {
                 app_state.filters.set_filter(FilterType::Tenant);
                 app_state.reset_selected_row();
+                false
             }
             event::KeyCode::Char('h') => {
                 app_state.filters.set_filter(FilterType::Host);
-                app_state.reset_selected_row()
+                app_state.reset_selected_row();
+                false
             }
-            event::KeyCode::Up => app_state.decrease_selected_row(),
-            event::KeyCode::Down => app_state.increase_selected_row(),
-
-            _ => {}
+            event::KeyCode::Up => {
+                app_state.decrease_selected_row();
+                false
+            }
+            event::KeyCode::Down => {
+                app_state.increase_selected_row();
+                false
+            }
+            _ => false,
         }
     }
 
@@ -122,14 +174,17 @@ impl TabState {
         }
     }
 
-    fn handle_key_event_backends_view(&mut self, key: KeyEvent, app_state: &mut AppState) {
+    fn handle_key_event_backends_view(&mut self, key: KeyEvent, app_state: &mut AppState) -> bool {
         if app_state.rendering.adding_backend {
             self.handle_key_event_backends_view_adding_backend(key, app_state);
         }
 
         match key.code {
-            event::KeyCode::Tab => self.cycle(),
-            event::KeyCode::Char('q') => std::process::exit(0),
+            event::KeyCode::Tab => {
+                self.cycle();
+                false
+            }
+            event::KeyCode::Char('q') => true,
             event::KeyCode::Char('p') => {
                 if let Some(ctx) = &self.poll_ctx {
                     let _ = if app_state.rendering.polling_paused {
@@ -138,14 +193,16 @@ impl TabState {
                         ctx.send(PollControl::Resume)
                     };
                 }
+                false
             }
             event::KeyCode::Char('a') => {
                 app_state.rendering.adding_backend = true;
                 app_state.rendering.add_buffer.clear();
+                false
             }
             event::KeyCode::Char('d') => {
                 if app_state.backends.is_empty() {
-                    return;
+                    return false;
                 }
 
                 let (addr, port) = app_state.backends[app_state.rendering.backends_sel].clone();
@@ -155,24 +212,27 @@ impl TabState {
                 app_state.backends.remove(app_state.rendering.backends_sel);
 
                 if app_state.rendering.backends_sel == 0 {
-                    return;
+                    return false;
                 }
 
                 if app_state.rendering.backends_sel >= app_state.backends.len() {
                     app_state.rendering.backends_sel -= 1;
                 }
+                false
             }
             event::KeyCode::Down => {
                 if app_state.rendering.backends_sel < app_state.backends.len() {
                     app_state.rendering.backends_sel += 1;
                 }
+                false
             }
             event::KeyCode::Up => {
                 if app_state.rendering.backends_sel > 0 {
                     app_state.rendering.backends_sel -= 1;
                 }
+                false
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -230,7 +290,12 @@ impl TabState {
         }
     }
 
-    fn handle_key_event_logs_view(&self, key: KeyEvent, app_state: &mut AppState) {}
+    fn handle_key_event_logs_view(&self, key: KeyEvent, _app_state: &mut AppState) -> bool {
+        match key.code {
+            event::KeyCode::Char('q') => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]

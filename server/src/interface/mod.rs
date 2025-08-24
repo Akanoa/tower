@@ -521,7 +521,8 @@ pub async fn run_tui(
         terminal.draw(|frame| app.render(frame, aggregator_mode, logs_available, &tab_state))?;
 
         // Input handling with small timeout to keep UI responsive
-        tab_state.handle_key_event(&mut app)?;
+        let should_quit = tab_state.handle_key_event(&mut app)?;
+        if should_quit { break; }
     }
 
     // Restore terminal
