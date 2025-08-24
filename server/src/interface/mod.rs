@@ -120,6 +120,28 @@ impl AppState {
             })
     }
 
+    fn get_tenant(&self, tenant: &str) -> Option<&TenantItem> {
+        self.tenants.get(tenant)
+    }
+
+    fn get_executor(&self, tenant: &str, executor_id: i64, host: &str) -> Option<&ExecutorItem> {
+        self.get_tenant(tenant)
+            .map(|tenant| tenant.executors.get(&(executor_id, host.to_string())))
+            .flatten()
+    }
+
+    pub fn get_watcher(
+        &self,
+        tenant: &str,
+        executor_id: i64,
+        host: &str,
+        watch_id: i64,
+    ) -> Option<&WatchItem> {
+        self.get_executor(tenant, executor_id, host)
+            .map(|exec| exec.watchers.get(&watch_id))
+            .flatten()
+    }
+
     /// Reset the visible row cursor
     fn reset_selected_row(&mut self) {
         self.selected_row = 0;
@@ -715,6 +737,7 @@ impl AppState {
                         } else if self.selected_row >= self.scroll_offset + page_size {
                             self.scroll_offset = self.selected_row + 1 - page_size;
                         }
+
                         let rows_slice: Vec<Row<'static>> = rows_full
                             .iter()
                             .cloned()
@@ -1003,6 +1026,7 @@ impl AppState {
                         } else if self.selected_row >= self.scroll_offset + page_size {
                             self.scroll_offset = self.selected_row + 1 - page_size;
                         }
+
                         let rows_slice: Vec<Row<'static>> = rows_full
                             .iter()
                             .cloned()

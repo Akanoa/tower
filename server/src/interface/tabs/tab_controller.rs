@@ -4,6 +4,8 @@ use crate::interface::tabs::tab_main_view::TabMainView;
 use crate::interface::tabs::{Tab, TabEvent};
 use ratatui::crossterm::event;
 use ratatui::crossterm::event::Event;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::widgets::{Block, Borders};
 use std::time::Duration;
 
 #[derive(PartialEq)]
@@ -44,17 +46,38 @@ impl TabController {
 }
 
 impl TabController {
-    fn render(&self) {
+    fn map_current_tab<F, R>(&mut self, mut f: F) -> Option<R>
+    where
+        F: FnMut(&mut dyn Tab) -> R,
+    {
         match self.current_tab {
-            TabKind::Main => self.tab_main_view.render(),
+            TabKind::Main => Some(f(&mut self.tab_main_view as &mut dyn Tab)),
             TabKind::Backends => {
-                if let Some(backends_tab) = &self.backends_tab {
-                    backends_tab.render()
+                if let Some(backends_tab) = &mut self.backends_tab {
+                    Some(f(backends_tab as &mut dyn Tab))
                 } else {
+                    None
                 }
             }
-            TabKind::Logs => self.logs_tab.render(),
+            TabKind::Logs => Some(f(&mut self.logs_tab as &mut dyn Tab)),
         }
+    }
+
+    fn render(&mut self, frame: &mut ratatui::Frame) {
+        let size = frame.area();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
+            .split(size);
+
+        let title = self.map_current_tab(|tab| tab.get_title());
+
+        if let Some(title) = title {
+            let header = Block::default().title(title).borders(Borders::ALL);
+            frame.render_widget(header, chunks[0]);
+        }
+
+        self.map_current_tab(|tab| tab.render(frame, chunks[1]));
     }
 
     fn update(&mut self) -> std::io::Result<TabEvent> {

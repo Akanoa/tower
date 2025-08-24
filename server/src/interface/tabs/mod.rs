@@ -1,6 +1,7 @@
 use crate::interface::tabs::tab_backends::BackendEvent;
 use crate::interface::tabs::tab_main_view::MainViewEvent;
 use ratatui::crossterm::event::KeyEvent;
+use ratatui::layout::Rect;
 
 mod tab_backends;
 mod tab_controller;
@@ -16,6 +17,7 @@ pub enum TabEvent {
 }
 
 trait Tab {
-    fn render(&self);
+    fn get_title(&self) -> String;
+    fn render(&mut self, frame: &mut ratatui::Frame, chunk: Rect);
     fn update(&mut self, key: KeyEvent) -> TabEvent;
 }

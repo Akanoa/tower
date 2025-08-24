@@ -2,6 +2,9 @@ use crate::interface::tabs::{Tab, TabEvent};
 use crate::tcp_server::PollControl;
 use ratatui::crossterm::event;
 use ratatui::crossterm::event::KeyEvent;
+use ratatui::layout::{Constraint, Rect};
+use ratatui::prelude::{Line, Modifier, Style};
+use ratatui::widgets::{Block, Borders, Row, Table};
 use tokio::sync::mpsc::UnboundedSender;
 
 pub enum BackendEvent {
@@ -12,7 +15,7 @@ pub enum BackendEvent {
 
 pub type BackendIdentifier = (String, u16);
 
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 enum Mode {
     #[default]
     View,
@@ -50,8 +53,75 @@ impl TabBackends {
 }
 
 impl Tab for TabBackends {
-    fn render(&self) {
-        todo!()
+    fn get_title(&self) -> String {
+        // Backends management tab
+        let title = if self.mode == Mode::Add {
+            format!(
+                "Backends Management [Tab switch | p {} | ENTER submit | ESC cancel] Add backend: {}",
+                if self.polling_paused {
+                    "resume"
+                } else {
+                    "pause"
+                },
+                self.adder.add_new_backend_buffer
+            )
+        } else {
+            format!(
+                "Backends Management [Tab switch | p {} | a add | d delete]",
+                if self.polling_paused {
+                    "resume"
+                } else {
+                    "pause"
+                }
+            )
+        };
+        title
+    }
+    fn render(&mut self, frame: &mut ratatui::Frame, chunk: Rect) {
+        // List backends and current state
+        let mut rows: Vec<Row<'static>> = Vec::new();
+        rows.push(
+            Row::new(vec![
+                Line::from("Backend"),
+                Line::from("Port"),
+                Line::from("State"),
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        );
+
+        let sel_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+        for (i, (addr, port)) in self.backends.iter().enumerate() {
+            let mut row = Row::new(vec![
+                Line::from(addr.clone()),
+                Line::from(port.to_string()),
+                Line::from(
+                    if self.polling_paused {
+                        "paused"
+                    } else {
+                        "running"
+                    }
+                    .to_string(),
+                ),
+            ]);
+            if i == self.selected_index {
+                row = row.style(sel_style);
+            }
+            rows.push(row);
+        }
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Percentage(60),
+                Constraint::Percentage(20),
+                Constraint::Percentage(20),
+            ],
+        )
+        .block(
+            Block::default()
+                .title("Configured backends")
+                .borders(Borders::ALL),
+        );
+        frame.render_widget(table, chunk);
     }
 
     fn update(&mut self, key: KeyEvent) -> TabEvent {
