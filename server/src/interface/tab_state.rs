@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
+#[derive(PartialEq)]
 pub enum Tab {
     Main,
     Backends,
@@ -25,10 +26,13 @@ pub struct TabState {
 }
 
 impl TabState {
-    fn new(poll_ctx: Option<UnboundedSender<PollControl>>) -> Self {
+    pub(crate) fn new(
+        poll_ctx: Option<UnboundedSender<PollControl>>,
+        tui_render: TuiRender,
+    ) -> Self {
         Self {
             tab: Tab::Main,
-            render: TuiRender::Local,
+            render: tui_render,
             poll_ctx,
         }
     }
@@ -44,6 +48,10 @@ impl TabState {
             Tab::Backends => Tab::Logs,
             Tab::Logs => Tab::Main,
         }
+    }
+
+    pub fn is_actual_tab(&self, tab: Tab) -> bool {
+        self.tab == tab
     }
 
     pub fn handle_key_event(&mut self, app_state: &mut AppState) -> std::io::Result<()> {

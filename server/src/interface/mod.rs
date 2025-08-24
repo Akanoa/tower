@@ -2,7 +2,7 @@ use crate::interface::filters::FilterType;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::interface::tab_state::Rendering;
+use crate::interface::tab_state::{Rendering, Tab, TabState, TuiRender};
 use crate::tcp_server::PollControl;
 use executor_item::ExecutorItem;
 use protocol::{Message, MessageBody, MessageRegister, MessageReport, MessageUnregister};
@@ -445,7 +445,6 @@ pub async fn run_tui(
     aggregator: Option<AggregatorTabConfig>,
     mut logs_rx: Option<mpsc::UnboundedReceiver<String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use ratatui::crossterm::event::{self, Event};
     use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     use ratatui::crossterm::{execute, terminal};
     use std::io::{stdout, Stdout};
@@ -475,12 +474,15 @@ pub async fn run_tui(
     } else {
         (Vec::new(), None)
     };
-    let mut in_backends_tab = false; // only meaningful if aggregator_mode
-    let mut in_logs_tab = false; // available in all modes if logs_rx is Some
-    let mut polling_paused = false;
-    let mut backends_sel: usize = 0;
-    let mut adding_backend = false;
-    let mut add_buffer = String::new();
+
+    let a = if aggregator_mode {
+        TuiRender::Aggregator
+    } else {
+        TuiRender::Local
+    };
+
+    let mut tab_state = TabState::new(control_tx_opt, a);
+
     app.backends = backends;
 
     // Logs state
@@ -516,226 +518,10 @@ pub async fn run_tui(
             }
         }
 
-        terminal.draw(|frame| {
-            app.render(
-                frame,
-                aggregator_mode,
-                logs_available,
-                &in_logs_tab,
-                &in_backends_tab,
-                &polling_paused,
-            )
-        })?;
+        terminal.draw(|frame| app.render(frame, aggregator_mode, logs_available, &tab_state))?;
 
         // Input handling with small timeout to keep UI responsive
-        if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    use ratatui::crossterm::event::KeyCode;
-                    if app.filters.is_filter_active(FilterType::Tenant)
-                        || app.filters.is_filter_active(FilterType::Host)
-                    {
-                        match key.code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('/') => {
-                                app.filters.disable_filter();
-                            }
-                            KeyCode::Backspace => {
-                                app.filters.pop_char();
-                                app.selected_row = 0;
-                            }
-                            KeyCode::Char(c) => {
-                                if !c.is_control() {
-                                    app.filters.push_char(c);
-                                    app.selected_row = 0;
-                                }
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        // Not in text filtering modes
-                        if in_logs_tab {
-                            match key.code {
-                                KeyCode::Tab => {
-                                    // Cycle: Logs -> Main if no aggregator, otherwise Logs -> Main
-                                    in_logs_tab = false;
-                                }
-                                KeyCode::Char('q') => break,
-                                KeyCode::Char('c') => {
-                                    logs.clear();
-                                    logs_offset = 0;
-                                }
-                                KeyCode::Up => {
-                                    // scroll up
-                                    if logs.len() > 0 {
-                                        // increase offset up to max
-                                        let max_off = logs.len().saturating_sub(1);
-                                        if logs_offset < max_off {
-                                            logs_offset += 1;
-                                        }
-                                    }
-                                }
-                                KeyCode::Down => {
-                                    if logs_offset > 0 {
-                                        logs_offset -= 1;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        } else if aggregator_mode && in_backends_tab {
-                            // Backends tab key handling
-                            match key.code {
-                                KeyCode::Tab => {
-                                    if logs_available {
-                                        in_backends_tab = false;
-                                        in_logs_tab = true;
-                                    } else {
-                                        in_backends_tab = false;
-                                    }
-                                }
-                                KeyCode::Char('p') => {
-                                    polling_paused = !polling_paused;
-                                    if let Some(ref txc) = control_tx_opt {
-                                        let _ = if polling_paused {
-                                            txc.send(PollControl::Pause)
-                                        } else {
-                                            txc.send(PollControl::Resume)
-                                        };
-                                    }
-                                }
-                                KeyCode::Char('q') => break,
-                                code => {
-                                    if adding_backend {
-                                        match code {
-                                            KeyCode::Esc => {
-                                                adding_backend = false;
-                                                add_buffer.clear();
-                                            }
-                                            KeyCode::Enter => {
-                                                if let Some((addr, port_str)) =
-                                                    add_buffer.split_once(':')
-                                                {
-                                                    if let Ok(port) = port_str.parse::<u16>() {
-                                                        let addr_s = addr.to_string();
-                                                        if !app.backends.iter().any(|(a, p)| {
-                                                            a == &addr_s && *p == port
-                                                        }) {
-                                                            app.backends
-                                                                .push((addr_s.clone(), port));
-                                                            if let Some(ref txc) = control_tx_opt {
-                                                                let _ = txc.send(
-                                                                    PollControl::AddBackend((
-                                                                        addr_s.clone(),
-                                                                        port,
-                                                                    )),
-                                                                );
-                                                            }
-                                                            backends_sel = app
-                                                                .backends
-                                                                .len()
-                                                                .saturating_sub(1);
-                                                        }
-                                                    }
-                                                }
-                                                adding_backend = false;
-                                                add_buffer.clear();
-                                            }
-                                            KeyCode::Backspace => {
-                                                add_buffer.pop();
-                                            }
-                                            KeyCode::Char(c) => {
-                                                if !c.is_control() {
-                                                    add_buffer.push(c);
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    } else {
-                                        match code {
-                                            KeyCode::Char('a') => {
-                                                adding_backend = true;
-                                                add_buffer.clear();
-                                            }
-                                            KeyCode::Char('d') => {
-                                                if !app.backends.is_empty()
-                                                    && backends_sel < app.backends.len()
-                                                {
-                                                    let (addr, port) =
-                                                        app.backends[backends_sel].clone();
-                                                    if let Some(ref txc) = control_tx_opt {
-                                                        let _ =
-                                                            txc.send(PollControl::RemoveBackend((
-                                                                addr.clone(),
-                                                                port,
-                                                            )));
-                                                    }
-                                                    app.backends.remove(backends_sel);
-                                                    if backends_sel >= app.backends.len()
-                                                        && backends_sel > 0
-                                                    {
-                                                        backends_sel -= 1;
-                                                    }
-                                                }
-                                            }
-                                            KeyCode::Down => {
-                                                if backends_sel + 1 < app.backends.len() {
-                                                    backends_sel += 1;
-                                                }
-                                            }
-                                            KeyCode::Up => {
-                                                if backends_sel > 0 {
-                                                    backends_sel -= 1;
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            // Main tab key handling
-                            match key.code {
-                                KeyCode::Tab => {
-                                    if aggregator_mode {
-                                        in_backends_tab = true;
-                                    } else if logs_available {
-                                        in_logs_tab = true;
-                                    }
-                                }
-                                KeyCode::Char('q') => break,
-                                KeyCode::Char('/') => {
-                                    app.filters.set_filter(FilterType::Tenant);
-                                    // filtering = true;
-                                    // filtering_host = false;
-                                    app.selected_row = 0;
-                                }
-                                KeyCode::Char('h') => {
-                                    app.filters.set_filter(FilterType::Host);
-                                    app.selected_row = 0;
-                                }
-                                KeyCode::Down => {
-                                    let max = app.visible_rows().len();
-                                    if app.selected_row + 1 < max {
-                                        app.selected_row += 1;
-                                    }
-                                }
-                                KeyCode::Up => {
-                                    if app.selected_row > 0 {
-                                        app.selected_row -= 1;
-                                    }
-                                }
-                                KeyCode::Right | KeyCode::Enter | KeyCode::Left => {
-                                    app.toggle_fold_at(app.selected_row);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                Event::Resize(_, _) => {}
-                _ => {}
-            }
-        }
+        tab_state.handle_key_event(&mut app)?;
     }
 
     // Restore terminal
@@ -756,24 +542,20 @@ impl AppState {
         frame: &mut Frame,
         aggregator_mode: bool,
         logs_available: bool,
-        in_logs_tab: &bool,
-        in_backends_tab: &bool,
-        polling_paused: &bool,
+        tab_state: &TabState,
     ) {
         let selected_watch = self.selected_watch_ids();
         let selected_tenant = self.selected_tenant_name();
 
         let Rendering {
-            // in_backends_tab,
-            // in_logs_tab,
-            // polling_paused,
-            mut backends_sel,
+            polling_paused,
+            backends_sel,
             adding_backend,
             add_buffer,
             logs,
             logs_offset,
             ..
-        } = self.rendering.clone();
+        } = &mut self.rendering;
 
         let size = frame.area();
         let chunks = Layout::default()
@@ -781,7 +563,7 @@ impl AppState {
             .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
             .split(size);
 
-        if *in_logs_tab {
+        if tab_state.is_actual_tab(Tab::Logs) {
             // Logs tab
             let title = "Logs [Tab switch | Up/Down scroll | c clear | q quit]".to_string();
             let header = Block::default().title(title).borders(Borders::ALL);
@@ -790,10 +572,10 @@ impl AppState {
             let area = chunks[1];
             let inner_height = area.height.saturating_sub(2) as usize; // rough estimate
             let total = logs.len();
-            let start = if logs_offset == 0 {
+            let start = if *logs_offset == 0 {
                 total.saturating_sub(inner_height)
             } else {
-                total.saturating_sub(inner_height + logs_offset)
+                total.saturating_sub(inner_height + *logs_offset)
             };
             let mut display: String = String::new();
             for line in logs.iter().skip(start).take(inner_height) {
@@ -804,9 +586,9 @@ impl AppState {
                 .block(Block::default().title("Recent logs").borders(Borders::ALL));
             frame.render_widget(paragraph, chunks[1]);
             return;
-        } else if aggregator_mode && *in_backends_tab {
+        } else if aggregator_mode && tab_state.is_actual_tab(Tab::Backends) {
             // Backends management tab
-            let title = if adding_backend {
+            let title = if *adding_backend {
                 format!(
                     "Backends Management [Tab switch | p {} | ENTER submit | ESC cancel] Add backend: {}",
                     if *polling_paused { "resume" } else { "pause" },
@@ -830,8 +612,8 @@ impl AppState {
                 ])
                 .style(Style::default().add_modifier(Modifier::BOLD)),
             );
-            if backends_sel >= self.backends.len() && !self.backends.is_empty() {
-                backends_sel = self.backends.len() - 1;
+            if *backends_sel >= self.backends.len() && !self.backends.is_empty() {
+                *backends_sel = self.backends.len() - 1;
             }
             let sel_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
             for (i, (addr, port)) in self.backends.iter().enumerate() {
@@ -840,7 +622,7 @@ impl AppState {
                     Line::from(port.to_string()),
                     Line::from(if *polling_paused { "paused" } else { "running" }.to_string()),
                 ]);
-                if i == backends_sel {
+                if i == *backends_sel {
                     row = row.style(sel_style);
                 }
                 rows.push(row);
