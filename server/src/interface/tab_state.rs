@@ -290,9 +290,13 @@ impl TabState {
         }
     }
 
-    fn handle_key_event_logs_view(&self, key: KeyEvent, _app_state: &mut AppState) -> bool {
+    fn handle_key_event_logs_view(&mut self, key: KeyEvent, _app_state: &mut AppState) -> bool {
         match key.code {
             event::KeyCode::Char('q') => true,
+            event::KeyCode::Tab => {
+                self.cycle();
+                false
+            }
             _ => false,
         }
     }

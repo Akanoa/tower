@@ -19,6 +19,7 @@ mod executor_item;
 mod filters;
 mod maths;
 mod tab_state;
+mod tabs;
 mod tenant_item;
 mod watch_item;
 
@@ -513,16 +514,17 @@ pub async fn run_tui(
                     let _ = logs.pop_front();
                 }
                 logs.push_back(line);
-                // keep following unless user scrolled up
-                if logs_offset == 0 {}
             }
         }
 
-        terminal.draw(|frame| app.render(frame, aggregator_mode, logs_available, &tab_state))?;
+        terminal
+            .draw(|frame| app.render(frame, aggregator_mode, logs_available, &tab_state, &logs))?;
 
         // Input handling with small timeout to keep UI responsive
         let should_quit = tab_state.handle_key_event(&mut app)?;
-        if should_quit { break; }
+        if should_quit {
+            break;
+        }
     }
 
     // Restore terminal
@@ -544,6 +546,7 @@ impl AppState {
         aggregator_mode: bool,
         logs_available: bool,
         tab_state: &TabState,
+        logs: &VecDeque<String>,
     ) {
         let selected_watch = self.selected_watch_ids();
         let selected_tenant = self.selected_tenant_name();
@@ -553,7 +556,6 @@ impl AppState {
             backends_sel,
             adding_backend,
             add_buffer,
-            logs,
             logs_offset,
             ..
         } = &mut self.rendering;
